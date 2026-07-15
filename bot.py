@@ -39,14 +39,14 @@ INBOUND_ID = int(os.getenv("INBOUND_ID", 1))
 parsed_url = urlparse(XUI_PANEL_URL)
 VPS_IP = parsed_url.hostname or "167.172.73.82"
 
-# Conversation States
+# Conversation States (GB Limit အဆင့် အသစ်ထည့်သွင်းထားသည်)
 (
-    ADD_NAME, ADD_EXPIRY, ADD_FLOW,
+    ADD_NAME, ADD_EXPIRY, ADD_DATA_LIMIT, ADD_FLOW,
     EDIT_EXPIRY_INPUT, EDIT_NAME_INPUT
-) = range(5)
+) = range(6)
 
 # ---------------------------------------------------------------------------
-# ၃။ 3x-ui API Client (Dynamic Links & Smart Session)
+# ၃။ 3x-ui API Client (Smart Session & Auto Re-login Enabled)
 # ---------------------------------------------------------------------------
 class XUIClient:
     def __init__(self, base_url: str, username: str, password: str):
@@ -61,12 +61,17 @@ class XUIClient:
         payload = {"username": self.username, "password": self.password}
         try:
             res = self.session.post(url, data=payload, timeout=10)
-            data = res.json()
-            if data.get("success", False):
-                self.is_logged_in = True
-                return True
+            try:
+                data = res.json()
+                if data.get("success", False):
+                    self.is_logged_in = True
+                    logger.info("✅ 3x-ui Panel သို့ အောင်မြင်စွာ Login ဝင်ရောက်ပါပြီ။")
+                    return True
+            except Exception:
+                logger.error(f"❌ Login Response is not JSON: {res.text[:100]}")
         except Exception as e:
-            logger.error(f"Login Error: {e}")
+            logger.error(f"❌ Login Connection Error: {e}")
+        self.is_logged_in = False
         return False
 
     def _request(self, method: str, endpoint: str, **kwargs) -> dict:
@@ -75,14 +80,20 @@ class XUIClient:
         url = f"{self.base_url}{endpoint}"
         try:
             res = self.session.request(method, url, timeout=10, **kwargs)
-            if res.status_code == 401 or "/login" in res.url:
+            try:
+                return res.json()
+            except Exception:
+                logger.warning("🔄 Session သက်တမ်းကုန်သွားပါသဖြင့် Auto Re-login ပြုလုပ်နေသည်...")
                 if self.login():
                     res = self.session.request(method, url, timeout=10, **kwargs)
+                    try:
+                        return res.json()
+                    except Exception:
+                        return {"success": False, "msg": f"Server Response Error: {res.text[:50]}"}
                 else:
                     return {"success": False, "msg": "Re-authentication failed."}
-            return res.json()
         except Exception as e:
-            return {"success": False, "msg": str(e)}
+            return {"success": False, "msg": f"Request Error: {str(e)}"}
 
     def get_inbound(self, inbound_id: int) -> dict:
         data = self._request("GET", f"/panel/api/inbounds/get/{inbound_id}")
@@ -104,20 +115,23 @@ class XUIClient:
                 return c
         return {}
 
-    def add_client(self, inbound_id: int, email: str, expiry_days: int, flow: str) -> tuple[bool, str, str]:
+    def add_client(self, inbound_id: int, email: str, expiry_days: int, total_gb: float, flow: str) -> tuple[bool, str, str]:
         client_uuid = str(uuid.uuid4())
         expiry_time = 0 if expiry_days <= 0 else int((time.time() + (expiry_days * 86400)) * 1000)
+        
+        # GB မှ Bytes သို့ ပြောင်းလဲခြင်း (0 = Unlimited)
+        total_bytes = 0 if total_gb <= 0 else int(total_gb * 1024 * 1024 * 1024)
 
         client_data = {
             "id": client_uuid, "flow": flow, "email": email,
-            "limitIp": 0, "totalGB": 0, "expiryTime": expiry_time,
+            "limitIp": 0, "totalGB": total_bytes, "expiryTime": expiry_time,
             "enable": True, "tgId": "", "subId": ""
         }
         payload = {"id": inbound_id, "settings": json.dumps({"clients": [client_data]})}
         res = self._request("POST", "/panel/api/inbounds/addClient", json=payload)
         
         if not res.get("success"):
-            return False, f"Key မဆောက်နိုင်ပါ: {res.get('msg', 'Error')}", ""
+            return False, f"Key မဆောက်နိုင်ပါ: {res.get('msg', 'Unknown Server Error')}", ""
         return True, client_uuid, self.build_vless_link(inbound_id, client_uuid, email, flow)
 
     def update_client(self, inbound_id: int, client_uuid: str, updated_data: dict) -> tuple[bool, str]:
@@ -249,6 +263,7 @@ async def show_client_detail(update: Update, context: ContextTypes.DEFAULT_TYPE,
     flow = client.get("flow", "") or "Default"
     enable = client.get("enable", False)
     expiry_time = client.get("expiryTime", 0)
+    total_gb_bytes = client.get("totalGB", 0)
 
     if expiry_time == 0:
         exp_str = "အကန့်အသတ်မရှိ (Unlimited) ♾️"
@@ -256,6 +271,7 @@ async def show_client_detail(update: Update, context: ContextTypes.DEFAULT_TYPE,
         days_left = int((expiry_time - int(time.time() * 1000)) / (1000 * 86400))
         exp_str = f"{time.strftime('%Y-%m-%d', time.localtime(expiry_time/1000))} ({days_left} ရက် လိုသေးသည်)" if days_left >= 0 else f"⚠️ ရက်လွန်သွားပါပြီ ({abs(days_left)} ရက်လွန်)"
 
+    gb_str = f"{round(total_gb_bytes / (1024**3), 2)} GB" if total_gb_bytes > 0 else "အကန့်အသတ်မရှိ (Unlimited) ♾️"
     status_str = "🟢 အသုံးပြုခွင့် ဖွင့်ထားသည် (Enabled)" if enable else "🔴 ပိတ်ထားသည် (Disabled)"
     vless_link = xui.build_vless_link(INBOUND_ID, client_uuid, email, flow)
 
@@ -273,6 +289,7 @@ async def show_client_detail(update: Update, context: ContextTypes.DEFAULT_TYPE,
         f"🔹 <b>အမည်:</b> <code>{email}</code>\n"
         f"🔹 <b>အခြေအနေ:</b> {status_str}\n"
         f"⏳ <b>သက်တမ်း:</b> <code>{exp_str}</code>\n"
+        f"📊 <b>Data Limit:</b> <code>{gb_str}</code>\n"
         f"⚡ <b>Flow:</b> <code>{flow}</code>\n\n"
         f"📋 <b>VLESS Link:</b>\n<code>{vless_link}</code>"
     )
@@ -291,7 +308,7 @@ async def toggle_client_status(update: Update, context: ContextTypes.DEFAULT_TYP
     await show_client_detail(update, context, client_uuid)
 
 # ---------------------------------------------------------------------------
-# ၇။ Add Key Step-by-Step (100% Button Driven)
+# ၇။ Add Key Step-by-Step (GB Limit ထည့်သွင်းထားသည်)
 # ---------------------------------------------------------------------------
 async def addkey_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -301,7 +318,7 @@ async def addkey_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     buttons = [[InlineKeyboardButton("❌ လုပ်ဆောင်ချက် ဖျက်သိမ်းမည်", callback_data="menu:home")]]
     await query.message.edit_text(
         "➕ <b>Key အသစ် ဆောက်လုပ်ခြင်း</b>\n\n"
-        "အဆင့် (၁/၃) : Client အတွက် <b>အမည် (Name / Remarks)</b> ရိုက်ထည့်ပေးပါ 👇\n\n<i>(ဥပမာ - MyPhone, MgMg_Laptop)</i>",
+        "အဆင့် (၁/၄) : Client အတွက် <b>အမည် (Name / Remarks)</b> ရိုက်ထည့်ပေးပါ 👇\n\n<i>(ဥပမာ - MyPhone, MgMg_Laptop)</i>",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons)
     )
     return ADD_NAME
@@ -319,8 +336,8 @@ async def addkey_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     await update.message.reply_text(
         f"✅ အမည် <b>{client_name}</b> ကို မှတ်သားပြီးပါပြီ။\n\n"
-        "⏳ <b>အဆင့် (၂/၃) : သက်တမ်း ရွေးချယ်ပါ</b>\n\n"
-        "အောက်ပါ ခလုတ်များမှ သက်တမ်း ရက်အရေအတွက် ရွေးချယ်ပါ သို့မဟုတ် ကိုယ်တိုင် ဂဏန်းရိုက်ထည့်ပါ 👇",
+        "⏳ <b>အဆင့် (၂/၄) : သက်တမ်း ရွေးချယ်ပါ</b>\n\n"
+        "အောက်ပါ ခလုတ်များမှ သက်တမ်း ရက်အရေအတွက် ရွေးချယ်ပါ သို့မဟုတ် ကိုယ်တိုင် ရက်အရေအတွက် ဂဏန်းရိုက်ထည့်ပါ 👇",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons)
     )
     return ADD_EXPIRY
@@ -335,12 +352,45 @@ async def addkey_receive_expiry(update: Update, context: ContextTypes.DEFAULT_TY
         try:
             expiry_days = int(update.message.text.strip())
         except ValueError:
-            await update.message.reply_text("⚠️ ကျေးဇူးပြု၍ ဂဏန်းကိန်းဂဏန်းသာ ရိုက်ထည့်ပါ သို့မဟုတ် ခလုတ်ကို နှိပ်ပါ။")
+            await update.message.reply_text("⚠️ ကျေးဇူးပြု၍ ရက်အရေအတွက်ကို ဂဏန်းကိန်းဂဏန်းသာ ရိုက်ထည့်ပါ သို့မဟုတ် ခလုတ်ကို နှိပ်ပါ။")
             return ADD_EXPIRY
         target_msg = update.message
 
     context.user_data["add_expiry"] = expiry_days
     expiry_str = f"{expiry_days} ရက်" if expiry_days > 0 else "အကန့်အသတ်မရှိ (Unlimited) ♾️"
+
+    # GB Limit ရွေးချယ်မည့် ခလုတ်များ ပြသခြင်း
+    buttons = [
+        [InlineKeyboardButton("♾️ အကန့်အသတ်မရှိ (Unlimited GB)", callback_data="add_gb:0")],
+        [InlineKeyboardButton("10 GB", callback_data="add_gb:10"), InlineKeyboardButton("30 GB", callback_data="add_gb:30")],
+        [InlineKeyboardButton("50 GB", callback_data="add_gb:50"), InlineKeyboardButton("100 GB", callback_data="add_gb:100")],
+        [InlineKeyboardButton("❌ ဖျက်သိမ်းမည်", callback_data="menu:home")]
+    ]
+    
+    await target_msg.reply_text(
+        f"✅ သက်တမ်း <b>{expiry_str}</b> သတ်မှတ်ပြီးပါပြီ။\n\n"
+        "📊 <b>အဆင့် (၃/၄) : Data Usage Limit (GB) သတ်မှတ်ပါ</b>\n\n"
+        "အောက်ပါ ခလုတ်များမှ ရွေးချယ်ပါ သို့မဟုတ် လိုချင်သော <b>GB ပမာဏကို ဂဏန်းဖြင့် ရိုက်ထည့်ပါ</b> (ဥပမာ - <code>15</code> ဟု ရိုက်လျှင် 15 GB ရမည်) 👇",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return ADD_DATA_LIMIT
+
+async def addkey_receive_data_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        total_gb = float(query.data.split(":")[1])
+        target_msg = query.message
+    else:
+        try:
+            total_gb = float(update.message.text.strip())
+        except ValueError:
+            await update.message.reply_text("⚠️ ကျေးဇူးပြု၍ GB ပမာဏကို ဂဏန်းသီးသန့်သာ ရိုက်ထည့်ပါ (ဥပမာ - <code>15</code> သို့မဟုတ် <code>0.5</code>)။")
+            return ADD_DATA_LIMIT
+        target_msg = update.message
+
+    context.user_data["add_gb"] = total_gb
+    gb_str = f"{total_gb} GB" if total_gb > 0 else "အကန့်အသတ်မရှိ (Unlimited GB) ♾️"
 
     buttons = [
         [InlineKeyboardButton("⚡ xtls-rprx-vision (Default - အကြံပြုသည်)", callback_data="add_flow:xtls-rprx-vision")],
@@ -349,8 +399,8 @@ async def addkey_receive_expiry(update: Update, context: ContextTypes.DEFAULT_TY
     ]
     
     await target_msg.reply_text(
-        f"✅ သက်တမ်း <b>{expiry_str}</b> သတ်မှတ်ပြီးပါပြီ။\n\n"
-        "⚡ <b>အဆင့် (၃/၃) : Traffic Flow ရွေးချယ်ပါ 👇</b>",
+        f"✅ Data Limit <b>{gb_str}</b> သတ်မှတ်ပြီးပါပြီ။\n\n"
+        "⚡ <b>အဆင့် (၄/၄) : Traffic Flow ရွေးချယ်ပါ 👇</b>",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons)
     )
     return ADD_FLOW
@@ -362,20 +412,26 @@ async def addkey_receive_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     name = context.user_data.get("add_name", "User")
     expiry = context.user_data.get("add_expiry", 0)
+    total_gb = context.user_data.get("add_gb", 0)
 
     await query.message.edit_text("⏳ <b>Key ဆောက်လုပ်နေပါသည်...</b> ခဏစောင့်ပေးပါ ခင်ဗျာ။ ⚙️", parse_mode="HTML")
 
-    success, uuid_or_err, vless_link = await asyncio.to_thread(xui.add_client, INBOUND_ID, name, expiry, flow)
+    success, uuid_or_err, vless_link = await asyncio.to_thread(
+        xui.add_client, INBOUND_ID, name, expiry, total_gb, flow
+    )
 
     if not success:
         await query.message.edit_text(f"❌ <b>Key ထုတ်ယူခြင်း မအောင်မြင်ပါ</b>\n\n{uuid_or_err}", parse_mode="HTML", reply_markup=get_back_button())
         return ConversationHandler.END
 
     expiry_str = f"{expiry} ရက်" if expiry > 0 else "အကန့်အသတ်မရှိ (Unlimited) ♾️"
+    gb_str = f"{total_gb} GB" if total_gb > 0 else "အကန့်အသတ်မရှိ (Unlimited GB) ♾️"
+
     success_msg = (
         "✅ <b>VLESS + Reality Key ထုတ်ယူခြင်း အောင်မြင်ပါသည်!</b> 🚀\n\n"
         f"👤 <b>အမည်:</b> <code>{name}</code>\n"
         f"⏳ <b>သက်တမ်း:</b> <code>{expiry_str}</code>\n"
+        f"📊 <b>Data Limit:</b> <code>{gb_str}</code>\n"
         f"⚡ <b>Flow:</b> <code>{flow or 'None'}</code>\n\n"
         f"📋 <b>VLESS Link (တစ်ချက်နှိပ်၍ Copy ကူးပါ) -</b>\n\n"
         f"<code>{vless_link}</code>"
@@ -494,6 +550,10 @@ def main():
             ADD_EXPIRY: [
                 CallbackQueryHandler(addkey_receive_expiry, pattern="^add_exp:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, addkey_receive_expiry)
+            ],
+            ADD_DATA_LIMIT: [
+                CallbackQueryHandler(addkey_receive_data_limit, pattern="^add_gb:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, addkey_receive_data_limit)
             ],
             ADD_FLOW: [CallbackQueryHandler(addkey_receive_flow, pattern="^add_flow:")]
         },
