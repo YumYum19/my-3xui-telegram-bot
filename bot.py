@@ -255,73 +255,86 @@ async def show_client_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_client_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, client_uuid: str):
     query = update.callback_query
     
-    # API မှ Inbound Data အားလုံးကို လှမ်းယူပါမည် (clientStats ပါဝင်ရန်)
-    inbound = await asyncio.to_thread(xui.get_inbound, INBOUND_ID)
-    
-    if not inbound:
-        await query.message.edit_text("❌ Inbound အချက်အလက် ရှာမတွေ့ပါ။", reply_markup=get_back_button())
-        return
-
-    settings = inbound.get("settings", {})
-    if isinstance(settings, str):
-        settings = json.loads(settings)
+    try:
+        # API မှ Inbound Data အားလုံးကို လှမ်းယူပါမည် (clientStats ပါဝင်ရန်)
+        inbound = await asyncio.to_thread(xui.get_inbound, INBOUND_ID)
         
-    client = next((c for c in settings.get("clients", []) if c.get("id") == client_uuid), None)
-    
-    if not client:
-        await query.message.edit_text("❌ Key အချက်အလက် ရှာမတွေ့ပါ။", reply_markup=get_back_button())
-        return
+        if not inbound:
+            await query.message.edit_text("❌ Inbound အချက်အလက် ရှာမတွေ့ပါ။", reply_markup=get_back_button())
+            return
 
-    email = client.get("email", "Unnamed")
-    
-    # ---------------------------------------------------------
-    # သုံးထားသော Data (GB) ကို တွက်ချက်ခြင်း
-    # ---------------------------------------------------------
-    client_stats = inbound.get("clientStats", [])
-    used_bytes = 0
-    for stat in client_stats:
-        if stat.get("email") == email:
-            used_bytes = stat.get("up", 0) + stat.get("down", 0)
-            break
+        settings = inbound.get("settings", {})
+        if isinstance(settings, str):
+            settings = json.loads(settings)
             
-    used_gb = round(used_bytes / (1024**3), 2)
-    # ---------------------------------------------------------
+        client = next((c for c in settings.get("clients", []) if c.get("id") == client_uuid), None)
+        
+        if not client:
+            await query.message.edit_text("❌ Key အချက်အလက် ရှာမတွေ့ပါ။", reply_markup=get_back_button())
+            return
 
-    flow = client.get("flow", "") or "Default"
-    enable = client.get("enable", False)
-    expiry_time = client.get("expiryTime", 0)
-    total_gb_bytes = client.get("totalGB", 0)
+        email = client.get("email", "Unnamed")
+        
+        # ---------------------------------------------------------
+        # သုံးထားသော Data (GB) ကို တွက်ချက်ခြင်း (Error မတက်စေရန် ကာကွယ်ထားသည်)
+        # ---------------------------------------------------------
+        client_stats = inbound.get("clientStats") or []  # null ဖြစ်နေခဲ့လျှင် empty list အဖြစ်ပြောင်းမည်
+        used_bytes = 0
+        for stat in client_stats:
+            if isinstance(stat, dict) and stat.get("email") == email:
+                used_bytes = int(stat.get("up", 0)) + int(stat.get("down", 0))
+                break
+                
+        used_gb = round(used_bytes / (1024**3), 2)
+        # ---------------------------------------------------------
 
-    if expiry_time == 0:
-        exp_str = "အကန့်အသတ်မရှိ (Unlimited) ♾️"
-    else:
-        days_left = int((expiry_time - int(time.time() * 1000)) / (1000 * 86400))
-        exp_str = f"{time.strftime('%Y-%m-%d', time.localtime(expiry_time/1000))} ({days_left} ရက် လိုသေးသည်)" if days_left >= 0 else f"⚠️ ရက်လွန်သွားပါပြီ ({abs(days_left)} ရက်လွန်)"
+        flow = client.get("flow", "") or "Default"
+        enable = client.get("enable", False)
+        
+        # String/Null တွေ ဝင်လာခဲ့ရင်တောင် Error မတက်အောင် int() ခံထားပါသည်
+        expiry_time = int(client.get("expiryTime") or 0)
+        total_gb_bytes = int(client.get("totalGB") or 0)
 
-    total_gb_str = f"{round(total_gb_bytes / (1024**3), 2)} GB" if total_gb_bytes > 0 else "Unlimited ♾️"
-    status_str = "🟢 အသုံးပြုခွင့် ဖွင့်ထားသည် (Enabled)" if enable else "🔴 ပိတ်ထားသည် (Disabled)"
-    vless_link = xui.build_vless_link(INBOUND_ID, client_uuid, email, flow)
+        if expiry_time <= 0:
+            exp_str = "အကန့်အသတ်မရှိ (Unlimited) ♾️"
+        else:
+            days_left = int((expiry_time - int(time.time() * 1000)) / (1000 * 86400))
+            if days_left >= 0:
+                exp_str = f"{time.strftime('%Y-%m-%d', time.localtime(expiry_time/1000))} ({days_left} ရက် လိုသေးသည်)"
+            else:
+                exp_str = f"⚠️ ရက်လွန်သွားပါပြီ ({abs(days_left)} ရက်လွန်)"
 
-    toggle_btn_text = "🔴 ယာယီ ပိတ်မည် (Disable)" if enable else "🟢 ပြန်လည် ဖွင့်မည် (Enable)"
-    
-    buttons = [
-        [InlineKeyboardButton(toggle_btn_text, callback_data=f"toggle:{client_uuid}")],
-        [InlineKeyboardButton("✏️ အမည်/သက်တမ်း ပြင်ဆင်မည် (Edit)", callback_data=f"edit_menu:{client_uuid}")],
-        [InlineKeyboardButton("📋 Key စာရင်းသို့ ပြန်သွားမည်", callback_data="menu:list_keys")],
-        [InlineKeyboardButton("🏠 ပင်မစာမျက်နှာသို့", callback_data="menu:home")]
-    ]
+        total_gb_str = f"{round(total_gb_bytes / (1024**3), 2)} GB" if total_gb_bytes > 0 else "Unlimited ♾️"
+        status_str = "🟢 အသုံးပြုခွင့် ဖွင့်ထားသည် (Enabled)" if enable else "🔴 ပိတ်ထားသည် (Disabled)"
+        
+        # Network Request ဖြစ်သည့်အတွက် async thread ဖြင့် ခေါ်ယူသည်
+        vless_link = await asyncio.to_thread(xui.build_vless_link, INBOUND_ID, client_uuid, email, flow)
 
-    msg = (
-        f"👤 <b>Client အချက်အလက် စီမံရန်</b>\n\n"
-        f"🔹 <b>အမည်:</b> <code>{email}</code>\n"
-        f"🔹 <b>အခြေအနေ:</b> {status_str}\n"
-        f"⏳ <b>သက်တမ်း:</b> <code>{exp_str}</code>\n"
-        f"📊 <b>Data Limit:</b> <code>{total_gb_str}</code>\n"
-        f"📈 <b>အသုံးပြုထားသော Data:</b> <code>{used_gb} GB</code>\n"
-        f"⚡ <b>Flow:</b> <code>{flow}</code>\n\n"
-        f"📋 <b>VLESS Link:</b>\n<code>{vless_link}</code>"
-    )
-    await query.message.edit_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+        toggle_btn_text = "🔴 ယာယီ ပိတ်မည် (Disable)" if enable else "🟢 ပြန်လည် ဖွင့်မည် (Enable)"
+        
+        buttons = [
+            [InlineKeyboardButton(toggle_btn_text, callback_data=f"toggle:{client_uuid}")],
+            [InlineKeyboardButton("✏️ အမည်/သက်တမ်း ပြင်ဆင်မည် (Edit)", callback_data=f"edit_menu:{client_uuid}")],
+            [InlineKeyboardButton("📋 Key စာရင်းသို့ ပြန်သွားမည်", callback_data="menu:list_keys")],
+            [InlineKeyboardButton("🏠 ပင်မစာမျက်နှာသို့", callback_data="menu:home")]
+        ]
+
+        msg = (
+            f"👤 <b>Client အချက်အလက် စီမံရန်</b>\n\n"
+            f"🔹 <b>အမည်:</b> <code>{email}</code>\n"
+            f"🔹 <b>အခြေအနေ:</b> {status_str}\n"
+            f"⏳ <b>သက်တမ်း:</b> <code>{exp_str}</code>\n"
+            f"📊 <b>Data Limit:</b> <code>{total_gb_str}</code>\n"
+            f"📈 <b>အသုံးပြုထားသော Data:</b> <code>{used_gb} GB</code>\n"
+            f"⚡ <b>Flow:</b> <code>{flow}</code>\n\n"
+            f"📋 <b>VLESS Link:</b>\n<code>{vless_link}</code>"
+        )
+        await query.message.edit_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+        
+    except Exception as e:
+        logger.error(f"Error in show_client_detail: {e}", exc_info=True)
+        # အကယ်၍ Error ထပ်တက်ခဲ့ပါက ဘာမှမပေါ်ဘဲ ငြိမ်သွားမည့်အစား ဘာ Error တက်နေလဲဆိုတာကို Bot မှ စာပြန်ပို့ပေးပါမည်
+        await query.message.edit_text(f"⚠️ <b>အမှားအယွင်းဖြစ်ပေါ်နေပါသည်</b>\n\nError Message: <code>{str(e)}</code>", parse_mode="HTML", reply_markup=get_back_button())
 
 async def toggle_client_status(update: Update, context: ContextTypes.DEFAULT_TYPE, client_uuid: str):
     query = update.callback_query
