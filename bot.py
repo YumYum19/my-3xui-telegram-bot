@@ -114,6 +114,14 @@ class XUIClient:
             if c.get("id") == client_uuid:
                 return c
         return {}
+    
+    # [အသစ်ထည့်သွင်းထားသော လုပ်ဆောင်ချက် - Traffic Data ကို သီးသန့်လှမ်းယူမည်]
+    def get_client_traffic(self, email: str) -> dict:
+        # 3x-ui ၏ သီးသန့် Traffic စစ်ဆေးသော API ကို အသုံးပြုခြင်းဖြစ်သည်
+        data = self._request("GET", f"/panel/api/inbounds/getClientTraffics/{email}")
+        if data.get("success"):
+            return data.get("obj", {})
+        return {}
 
     def add_client(self, inbound_id: int, email: str, expiry_days: int, total_gb: float, flow: str) -> tuple[bool, str, str]:
         client_uuid = str(uuid.uuid4())
@@ -256,18 +264,8 @@ async def show_client_detail(update: Update, context: ContextTypes.DEFAULT_TYPE,
     query = update.callback_query
     
     try:
-        # API မှ Inbound Data အားလုံးကို လှမ်းယူပါမည် (clientStats ပါဝင်ရန်)
-        inbound = await asyncio.to_thread(xui.get_inbound, INBOUND_ID)
-        
-        if not inbound:
-            await query.message.edit_text("❌ Inbound အချက်အလက် ရှာမတွေ့ပါ။", reply_markup=get_back_button())
-            return
-
-        settings = inbound.get("settings", {})
-        if isinstance(settings, str):
-            settings = json.loads(settings)
-            
-        client = next((c for c in settings.get("clients", []) if c.get("id") == client_uuid), None)
+        # Client ရဲ့ Data ကို အရင်လှမ်းယူပါမည်
+        client = await asyncio.to_thread(xui.get_client_by_uuid, INBOUND_ID, client_uuid)
         
         if not client:
             await query.message.edit_text("❌ Key အချက်အလက် ရှာမတွေ့ပါ။", reply_markup=get_back_button())
@@ -276,22 +274,16 @@ async def show_client_detail(update: Update, context: ContextTypes.DEFAULT_TYPE,
         email = client.get("email", "Unnamed")
         
         # ---------------------------------------------------------
-        # သုံးထားသော Data (GB) ကို တွက်ချက်ခြင်း (Error မတက်စေရန် ကာကွယ်ထားသည်)
+        # အသုံးပြုထားသော Data (GB) ကို တွက်ချက်ခြင်း (API အသစ်အသုံးပြုထားသည်)
         # ---------------------------------------------------------
-        client_stats = inbound.get("clientStats") or []  # null ဖြစ်နေခဲ့လျှင် empty list အဖြစ်ပြောင်းမည်
-        used_bytes = 0
-        for stat in client_stats:
-            if isinstance(stat, dict) and stat.get("email") == email:
-                used_bytes = int(stat.get("up", 0)) + int(stat.get("down", 0))
-                break
-                
+        traffic_data = await asyncio.to_thread(xui.get_client_traffic, email)
+        used_bytes = int(traffic_data.get("up", 0)) + int(traffic_data.get("down", 0))
         used_gb = round(used_bytes / (1024**3), 2)
         # ---------------------------------------------------------
 
         flow = client.get("flow", "") or "Default"
         enable = client.get("enable", False)
         
-        # String/Null တွေ ဝင်လာခဲ့ရင်တောင် Error မတက်အောင် int() ခံထားပါသည်
         expiry_time = int(client.get("expiryTime") or 0)
         total_gb_bytes = int(client.get("totalGB") or 0)
 
@@ -307,7 +299,6 @@ async def show_client_detail(update: Update, context: ContextTypes.DEFAULT_TYPE,
         total_gb_str = f"{round(total_gb_bytes / (1024**3), 2)} GB" if total_gb_bytes > 0 else "Unlimited ♾️"
         status_str = "🟢 အသုံးပြုခွင့် ဖွင့်ထားသည် (Enabled)" if enable else "🔴 ပိတ်ထားသည် (Disabled)"
         
-        # Network Request ဖြစ်သည့်အတွက် async thread ဖြင့် ခေါ်ယူသည်
         vless_link = await asyncio.to_thread(xui.build_vless_link, INBOUND_ID, client_uuid, email, flow)
 
         toggle_btn_text = "🔴 ယာယီ ပိတ်မည် (Disable)" if enable else "🟢 ပြန်လည် ဖွင့်မည် (Enable)"
@@ -333,7 +324,6 @@ async def show_client_detail(update: Update, context: ContextTypes.DEFAULT_TYPE,
         
     except Exception as e:
         logger.error(f"Error in show_client_detail: {e}", exc_info=True)
-        # အကယ်၍ Error ထပ်တက်ခဲ့ပါက ဘာမှမပေါ်ဘဲ ငြိမ်သွားမည့်အစား ဘာ Error တက်နေလဲဆိုတာကို Bot မှ စာပြန်ပို့ပေးပါမည်
         await query.message.edit_text(f"⚠️ <b>အမှားအယွင်းဖြစ်ပေါ်နေပါသည်</b>\n\nError Message: <code>{str(e)}</code>", parse_mode="HTML", reply_markup=get_back_button())
 
 async def toggle_client_status(update: Update, context: ContextTypes.DEFAULT_TYPE, client_uuid: str):
