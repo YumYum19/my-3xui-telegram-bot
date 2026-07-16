@@ -39,7 +39,7 @@ INBOUND_ID = int(os.getenv("INBOUND_ID", 1))
 parsed_url = urlparse(XUI_PANEL_URL)
 VPS_IP = parsed_url.hostname or "167.172.73.82"
 
-# Conversation States (GB Limit အဆင့် အသစ်ထည့်သွင်းထားသည်)
+# Conversation States
 (
     ADD_NAME, ADD_EXPIRY, ADD_DATA_LIMIT, ADD_FLOW,
     EDIT_EXPIRY_INPUT, EDIT_NAME_INPUT
@@ -224,7 +224,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_edit_menu(update, context, client_uuid)
 
 # ---------------------------------------------------------------------------
-# ၆။ Key စာရင်းနှင့် စီမံခန့်ခွဲမှု (List, Disable, Enable & Edit)
+# ၆။ Key စာရင်းနှင့် စီမံခန့်ခွဲမှု (List, Disable, Enable, Edit & Data Usage)
 # ---------------------------------------------------------------------------
 async def show_client_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -254,12 +254,39 @@ async def show_client_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_client_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, client_uuid: str):
     query = update.callback_query
-    client = await asyncio.to_thread(xui.get_client_by_uuid, INBOUND_ID, client_uuid)
+    
+    # API မှ Inbound Data အားလုံးကို လှမ်းယူပါမည် (clientStats ပါဝင်ရန်)
+    inbound = await asyncio.to_thread(xui.get_inbound, INBOUND_ID)
+    
+    if not inbound:
+        await query.message.edit_text("❌ Inbound အချက်အလက် ရှာမတွေ့ပါ။", reply_markup=get_back_button())
+        return
+
+    settings = inbound.get("settings", {})
+    if isinstance(settings, str):
+        settings = json.loads(settings)
+        
+    client = next((c for c in settings.get("clients", []) if c.get("id") == client_uuid), None)
+    
     if not client:
         await query.message.edit_text("❌ Key အချက်အလက် ရှာမတွေ့ပါ။", reply_markup=get_back_button())
         return
 
     email = client.get("email", "Unnamed")
+    
+    # ---------------------------------------------------------
+    # သုံးထားသော Data (GB) ကို တွက်ချက်ခြင်း
+    # ---------------------------------------------------------
+    client_stats = inbound.get("clientStats", [])
+    used_bytes = 0
+    for stat in client_stats:
+        if stat.get("email") == email:
+            used_bytes = stat.get("up", 0) + stat.get("down", 0)
+            break
+            
+    used_gb = round(used_bytes / (1024**3), 2)
+    # ---------------------------------------------------------
+
     flow = client.get("flow", "") or "Default"
     enable = client.get("enable", False)
     expiry_time = client.get("expiryTime", 0)
@@ -271,7 +298,7 @@ async def show_client_detail(update: Update, context: ContextTypes.DEFAULT_TYPE,
         days_left = int((expiry_time - int(time.time() * 1000)) / (1000 * 86400))
         exp_str = f"{time.strftime('%Y-%m-%d', time.localtime(expiry_time/1000))} ({days_left} ရက် လိုသေးသည်)" if days_left >= 0 else f"⚠️ ရက်လွန်သွားပါပြီ ({abs(days_left)} ရက်လွန်)"
 
-    gb_str = f"{round(total_gb_bytes / (1024**3), 2)} GB" if total_gb_bytes > 0 else "အကန့်အသတ်မရှိ (Unlimited) ♾️"
+    total_gb_str = f"{round(total_gb_bytes / (1024**3), 2)} GB" if total_gb_bytes > 0 else "Unlimited ♾️"
     status_str = "🟢 အသုံးပြုခွင့် ဖွင့်ထားသည် (Enabled)" if enable else "🔴 ပိတ်ထားသည် (Disabled)"
     vless_link = xui.build_vless_link(INBOUND_ID, client_uuid, email, flow)
 
@@ -289,7 +316,8 @@ async def show_client_detail(update: Update, context: ContextTypes.DEFAULT_TYPE,
         f"🔹 <b>အမည်:</b> <code>{email}</code>\n"
         f"🔹 <b>အခြေအနေ:</b> {status_str}\n"
         f"⏳ <b>သက်တမ်း:</b> <code>{exp_str}</code>\n"
-        f"📊 <b>Data Limit:</b> <code>{gb_str}</code>\n"
+        f"📊 <b>Data Limit:</b> <code>{total_gb_str}</code>\n"
+        f"📈 <b>အသုံးပြုထားသော Data:</b> <code>{used_gb} GB</code>\n"
         f"⚡ <b>Flow:</b> <code>{flow}</code>\n\n"
         f"📋 <b>VLESS Link:</b>\n<code>{vless_link}</code>"
     )
@@ -308,7 +336,7 @@ async def toggle_client_status(update: Update, context: ContextTypes.DEFAULT_TYP
     await show_client_detail(update, context, client_uuid)
 
 # ---------------------------------------------------------------------------
-# ၇။ Add Key Step-by-Step (GB Limit ထည့်သွင်းထားသည်)
+# ၇။ Add Key Step-by-Step
 # ---------------------------------------------------------------------------
 async def addkey_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -359,7 +387,6 @@ async def addkey_receive_expiry(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data["add_expiry"] = expiry_days
     expiry_str = f"{expiry_days} ရက်" if expiry_days > 0 else "အကန့်အသတ်မရှိ (Unlimited) ♾️"
 
-    # GB Limit ရွေးချယ်မည့် ခလုတ်များ ပြသခြင်း
     buttons = [
         [InlineKeyboardButton("♾️ အကန့်အသတ်မရှိ (Unlimited GB)", callback_data="add_gb:0")],
         [InlineKeyboardButton("10 GB", callback_data="add_gb:10"), InlineKeyboardButton("30 GB", callback_data="add_gb:30")],
@@ -440,7 +467,7 @@ async def addkey_receive_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
-# ၈။ Edit Key Handlers (100% Button Driven)
+# ၈။ Edit Key Handlers
 # ---------------------------------------------------------------------------
 async def show_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, client_uuid: str):
     query = update.callback_query
