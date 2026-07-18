@@ -4,6 +4,7 @@ import uuid
 import time
 import logging
 import asyncio
+import sqlite3
 from urllib.parse import urlparse, quote
 import requests
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -18,39 +19,80 @@ from telegram.ext import (
 )
 
 # ---------------------------------------------------------------------------
-# ၁။ Logging Setup (Railway တွင် စောင့်ကြည့်ရန်)
+# ၁။ Logging & Environment Setup
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# ၂။ Environment Variables & Fallback Credentials
-# ---------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8993287223:AAHnmFVfJTHkTURQNsFZeZJtRk1REfB5NEg")
 ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", 1824573670))
 
-XUI_PANEL_URL = os.getenv("XUI_PANEL_URL", "http://167.172.73.82:53073/KycDj1Uzisw3vpu").rstrip("/")
-XUI_USERNAME = os.getenv("XUI_USERNAME", "auzbMTwGgX")
-XUI_PASSWORD = os.getenv("XUI_PASSWORD", "skA9eqRFHv")
-INBOUND_ID = int(os.getenv("INBOUND_ID", 1))
-
-parsed_url = urlparse(XUI_PANEL_URL)
-VPS_IP = parsed_url.hostname or "167.172.73.82"
-
 # Conversation States
 (
+    ADD_SRV_NAME, ADD_SRV_URL, ADD_SRV_USER, ADD_SRV_PASS, ADD_SRV_INBOUND,
     ADD_NAME, ADD_EXPIRY, ADD_DATA_LIMIT, ADD_FLOW,
     EDIT_EXPIRY_INPUT, EDIT_NAME_INPUT
-) = range(6)
+) = range(11)
+
+# ---------------------------------------------------------------------------
+# ၂။ SQLite Database Setup (Multi-Server Storage)
+# ---------------------------------------------------------------------------
+DB_FILE = "servers.db"
+
+def init_db():
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS servers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                url TEXT NOT NULL,
+                username TEXT NOT NULL,
+                password TEXT NOT NULL,
+                inbound_id INTEGER NOT NULL
+            )
+        """)
+        conn.commit()
+
+def get_all_servers() -> list[dict]:
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM servers ORDER BY id DESC").fetchall()
+        return [dict(row) for row in rows]
+
+def get_server_by_id(server_id: int) -> dict | None:
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM servers WHERE id = ?", (server_id,)).fetchone()
+        return dict(row) if row else None
+
+def add_server_to_db(name: str, url: str, username: str, password: str, inbound_id: int) -> tuple[bool, str]:
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute(
+                "INSERT INTO servers (name, url, username, password, inbound_id) VALUES (?, ?, ?, ?, ?)",
+                (name, url.rstrip("/"), username, password, inbound_id)
+            )
+            conn.commit()
+        return True, "ဆာဗာ ထည့်သွင်းမှု အောင်မြင်ပါသည်။"
+    except sqlite3.IntegrityError:
+        return False, "ဤဆာဗာအမည်ဖြင့် သိမ်းဆည်းထားပြီး ဖြစ်နေပါသည်။ အမည်ပြောင်း၍ ပြန်ကြိုးစားပါ။"
+    except Exception as e:
+        return False, f"Database အမှား - {str(e)}"
+
+def delete_server_from_db(server_id: int) -> bool:
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.execute("DELETE FROM servers WHERE id = ?", (server_id,))
+        conn.commit()
+        return cursor.rowcount > 0
 
 # ---------------------------------------------------------------------------
 # ၃။ 3x-ui API Client (Smart Session & Auto Re-login Enabled)
 # ---------------------------------------------------------------------------
 class XUIClient:
     def __init__(self, base_url: str, username: str, password: str):
-        self.base_url = base_url
+        self.base_url = base_url.rstrip("/")
         self.username = username
         self.password = password
         self.session = requests.Session()
@@ -65,7 +107,7 @@ class XUIClient:
                 data = res.json()
                 if data.get("success", False):
                     self.is_logged_in = True
-                    logger.info("✅ 3x-ui Panel သို့ အောင်မြင်စွာ Login ဝင်ရောက်ပါပြီ။")
+                    logger.info(f"✅ Panel ({self.base_url}) သို့ Login ဝင်ရောက်ပါပြီ။")
                     return True
             except Exception:
                 logger.error(f"❌ Login Response is not JSON: {res.text[:100]}")
@@ -83,7 +125,7 @@ class XUIClient:
             try:
                 return res.json()
             except Exception:
-                logger.warning("🔄 Session သက်တမ်းကုန်သွားပါသဖြင့် Auto Re-login ပြုလုပ်နေသည်...")
+                logger.warning("🔄 Session သက်တမ်းကုန်သွားပါသဖြင့် Re-login ပြုလုပ်နေသည်...")
                 if self.login():
                     res = self.session.request(method, url, timeout=10, **kwargs)
                     try:
@@ -115,9 +157,7 @@ class XUIClient:
                 return c
         return {}
     
-    # [အသစ်ထည့်သွင်းထားသော လုပ်ဆောင်ချက် - Traffic Data ကို သီးသန့်လှမ်းယူမည်]
     def get_client_traffic(self, email: str) -> dict:
-        # 3x-ui ၏ သီးသန့် Traffic စစ်ဆေးသော API ကို အသုံးပြုခြင်းဖြစ်သည်
         data = self._request("GET", f"/panel/api/inbounds/getClientTraffics/{email}")
         if data.get("success"):
             return data.get("obj", {})
@@ -126,8 +166,6 @@ class XUIClient:
     def add_client(self, inbound_id: int, email: str, expiry_days: int, total_gb: float, flow: str) -> tuple[bool, str, str]:
         client_uuid = str(uuid.uuid4())
         expiry_time = 0 if expiry_days <= 0 else int((time.time() + (expiry_days * 86400)) * 1000)
-        
-        # GB မှ Bytes သို့ ပြောင်းလဲခြင်း (0 = Unlimited)
         total_bytes = 0 if total_gb <= 0 else int(total_gb * 1024 * 1024 * 1024)
 
         client_data = {
@@ -150,9 +188,11 @@ class XUIClient:
         return False, f"❌ ပြင်ဆင်မှု မအောင်မြင်ပါ: {res.get('msg', 'Unknown')}"
 
     def build_vless_link(self, inbound_id: int, client_uuid: str, email: str, flow: str) -> str:
+        parsed = urlparse(self.base_url)
+        vps_ip = parsed.hostname or "127.0.0.1"
         inbound = self.get_inbound(inbound_id)
         if not inbound:
-            return f"vless://{client_uuid}@{VPS_IP}:443?security=reality#{quote(email)}"
+            return f"vless://{client_uuid}@{vps_ip}:443?security=reality#{quote(email)}"
         try:
             port = inbound.get("port", 443)
             stream = json.loads(inbound.get("streamSettings", "{}")) if isinstance(inbound.get("streamSettings"), str) else inbound.get("streamSettings", {})
@@ -169,41 +209,74 @@ class XUIClient:
             params = f"type=tcp&security=reality&pbk={pbk}&fp={fp}&sni={sni}"
             if sid: params += f"&sid={sid}"
             if flow: params += f"&flow={flow}"
-            return f"vless://{client_uuid}@{VPS_IP}:{port}?{params}#{quote(email)}"
+            return f"vless://{client_uuid}@{vps_ip}:{port}?{params}#{quote(email)}"
         except Exception:
-            return f"vless://{client_uuid}@{VPS_IP}:443?security=reality#{quote(email)}"
+            return f"vless://{client_uuid}@{vps_ip}:443?security=reality#{quote(email)}"
 
-xui = XUIClient(XUI_PANEL_URL, XUI_USERNAME, XUI_PASSWORD)
+# Cached Client Instances
+active_xui_clients: dict[int, XUIClient] = {}
+
+def get_client(server_data: dict) -> XUIClient:
+    s_id = server_data["id"]
+    if s_id not in active_xui_clients:
+        active_xui_clients[s_id] = XUIClient(server_data["url"], server_data["username"], server_data["password"])
+    return active_xui_clients[s_id]
 
 # ---------------------------------------------------------------------------
-# ၄။ UI Helpers (Main Menu & Back Buttons)
+# ၄။ UI Keyboards
 # ---------------------------------------------------------------------------
-def get_main_menu_keyboard():
+def get_server_list_keyboard(servers: list[dict]):
+    buttons = []
+    for srv in servers:
+        buttons.append([InlineKeyboardButton(f"🖥️ {srv['name']}", callback_data=f"srv_sel:{srv['id']}")])
+    buttons.append([InlineKeyboardButton("➕ ဆာဗာအသစ် ထပ်ထည့်ရန်", callback_data="srv_add")])
+    if servers:
+        buttons.append([InlineKeyboardButton("🗑️ ဆာဗာများ ဖျက်သိမ်းရန်", callback_data="srv_del_menu")])
+    return InlineKeyboardMarkup(buttons)
+
+def get_dashboard_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ VLESS Key အသစ်ဆောက်ရန်", callback_data="menu:add_key")],
         [InlineKeyboardButton("📋 Key စာရင်းများ စီမံရန် (Enable/Disable/Edit)", callback_data="menu:list_keys")],
-        [InlineKeyboardButton("🔄 Panel အခြေအနေ ပြန်လည်စစ်ဆေးရန်", callback_data="menu:refresh")]
+        [InlineKeyboardButton("🔄 Panel အခြေအနေ ပြန်လည်စစ်ဆေးရန်", callback_data="menu:refresh")],
+        [InlineKeyboardButton("🔙 ဆာဗာရွေးချယ်သည့် စာမျက်နှာသို့", callback_data="menu:servers")]
     ])
 
-def get_back_button():
+def get_back_to_dashboard_button():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏠 ပင်မစာမျက်နှာသို့ ပြန်သွားမည်", callback_data="menu:home")]
+        [InlineKeyboardButton("🔙 ဆာဗာ Dashboard သို့ ပြန်သွားမည်", callback_data="menu:dashboard")]
     ])
 
 # ---------------------------------------------------------------------------
-# ၅။ Main Menu Handlers
+# ၅။ Startup & Server Selection Flow
 # ---------------------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
-    msg = (
-        "🚀 <b>3x-ui Reality VPN Control Panel</b>\n\n"
-        "လိုချင်သော လုပ်ဆောင်ချက်ကို အောက်ပါ ခလုတ်များမှ တစ်ဆင့် ရွေးချယ်ပါ ခင်ဗျာ 👇"
-    )
+    
+    servers = await asyncio.to_thread(get_all_servers)
+    
+    # ဆာဗာ လုံးဝမရှိသေးပါက Add Server Wizard သို့ အလိုအလျောက် ပို့မည်
+    if not servers:
+        msg = (
+            "🚀 <b>3x-ui Multi-Server Manager</b> သို့ ကြိုဆိုပါသည်!\n\n"
+            "⚠️ <b>လက်ရှိတွင် ဆာဗာတစ်ခုမှ မရှိသေးပါ။</b>\n\n"
+            "ကျေးဇူးပြု၍ ပထမဆုံး ဆာဗာအတွက် <b>ဆာဗာအမည် (Server Name)</b> ရိုက်ထည့်ပေးပါ 👇\n"
+            "<i>(ဥပမာ - SG-Server-1, US-Premium)</i>"
+        )
+        if update.message:
+            await update.message.reply_text(msg, parse_mode="HTML")
+        elif update.callback_query:
+            await update.callback_query.message.edit_text(msg, parse_mode="HTML")
+        return ADD_SRV_NAME
+
+    # ဆာဗာရှိပြီးသားဖြစ်ပါက Menu ပြမည်
+    msg = "🚀 <b>3x-ui Multi-Server Manager</b>\n\nစီမံလိုသော ဆာဗာကို အောက်ပါစာရင်းမှ ရွေးချယ်ပါ 👇"
     if update.message:
-        await update.message.reply_text(msg, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
+        await update.message.reply_text(msg, parse_mode="HTML", reply_markup=get_server_list_keyboard(servers))
     elif update.callback_query:
-        await update.callback_query.message.edit_text(msg, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
+        await update.callback_query.message.edit_text(msg, parse_mode="HTML", reply_markup=get_server_list_keyboard(servers))
+    return ConversationHandler.END
 
 async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -212,78 +285,182 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     data = query.data
-    if data in ["menu:home", "menu:refresh"]:
+    if data == "menu:servers":
         await start_command(update, context)
         return ConversationHandler.END
+
+    elif data == "menu:dashboard" or data == "menu:refresh":
+        srv = context.user_data.get("active_server")
+        if not srv:
+            await start_command(update, context)
+            return ConversationHandler.END
+        
+        msg = (
+            f"📌 <b>Active Server Dashboard</b>\n\n"
+            f"🖥️ <b>ဆာဗာ:</b> <code>{srv['name']}</code>\n"
+            f"🔗 <b>Link:</b> <code>{srv['url']}</code>\n"
+            f"🎯 <b>Inbound ID:</b> <code>{srv['inbound_id']}</code>\n\n"
+            f"အောက်ပါ လုပ်ဆောင်ချက်များမှ တစ်ခု ရွေးချယ်ပါ 👇"
+        )
+        await query.message.edit_text(msg, parse_mode="HTML", reply_markup=get_dashboard_keyboard())
+
+    elif data.startswith("srv_sel:"):
+        srv_id = int(data.split(":")[1])
+        srv = await asyncio.to_thread(get_server_by_id, srv_id)
+        if not srv:
+            await query.message.edit_text("❌ ဆာဗာ ရှာမတွေ့ပါ။", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ပြန်သွားမည်", callback_data="menu:servers")]]))
+            return
+        
+        context.user_data["active_server"] = srv
+        await menu_router(update, context)  # Dashboard သို့ ပြန်ခေါ်မည်
+
+    elif data == "srv_del_menu":
+        servers = await asyncio.to_thread(get_all_servers)
+        buttons = [[InlineKeyboardButton(f"🗑️ ဖျက်မည် - {s['name']}", callback_data=f"srv_del_act:{s['id']}")] for s in servers]
+        buttons.append([InlineKeyboardButton("🔙 နောက်သို့", callback_data="menu:servers")])
+        await query.message.edit_text("🗑️ <b>ဖျက်သိမ်းလိုသော ဆာဗာကို ရွေးချယ်ပါ</b> 👇", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("srv_del_act:"):
+        srv_id = int(data.split(":")[1])
+        await asyncio.to_thread(delete_server_from_db, srv_id)
+        if srv_id in active_xui_clients:
+            del active_xui_clients[srv_id]
+        await query.answer("✅ ဆာဗာ ဖျက်သိမ်းပြီးပါပြီ။")
+        await start_command(update, context)
 
     elif data == "menu:list_keys":
         await show_client_list(update, context)
 
     elif data.startswith("client_detail:"):
-        client_uuid = data.split(":")[1]
-        await show_client_detail(update, context, client_uuid)
+        await show_client_detail(update, context, data.split(":")[1])
 
     elif data.startswith("toggle:"):
-        client_uuid = data.split(":")[1]
-        await toggle_client_status(update, context, client_uuid)
+        await toggle_client_status(update, context, data.split(":")[1])
 
     elif data.startswith("edit_menu:"):
-        client_uuid = data.split(":")[1]
-        await show_edit_menu(update, context, client_uuid)
+        await show_edit_menu(update, context, data.split(":")[1])
 
 # ---------------------------------------------------------------------------
-# ၆။ Key စာရင်းနှင့် စီမံခန့်ခွဲမှု (List, Disable, Enable, Edit & Data Usage)
+# ၆။ Add Server Wizard (ဆာဗာအသစ် ထည့်သွင်းခြင်း)
+# ---------------------------------------------------------------------------
+async def srv_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
+    
+    await query.message.edit_text(
+        "➕ <b>ဆာဗာအသစ် ထည့်သွင်းခြင်း (၁/၅)</b>\n\n"
+        "ကျေးဇူးပြု၍ ဆာဗာအတွက် <b>အမည် (Server Name)</b> ရိုက်ထည့်ပေးပါ 👇\n<i>(ဥပမာ - SG-Server-1)</i>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ဖျက်သိမ်းမည်", callback_data="menu:servers")]])
+    )
+    return ADD_SRV_NAME
+
+async def srv_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["srv_name"] = update.message.text.strip()
+    await update.message.reply_text(
+        f"✅ ဆာဗာအမည် <b>{context.user_data['srv_name']}</b> မှတ်သားပြီးပါပြီ။\n\n"
+        "🔗 <b>အဆင့် (၂/၅): 3x-ui Panel Link ရိုက်ထည့်ပါ</b> 👇\n"
+        "<i>(ဥပမာ - http://167.172.73.82:53073/KycDj1Uzisw3vpu)</i>",
+        parse_mode="HTML"
+    )
+    return ADD_SRV_URL
+
+async def srv_receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    url = update.message.text.strip().rstrip("/")
+    if not url.startswith("http://") and not url.startswith("https://"):
+        await update.message.reply_text("⚠️ Link URL သည် http:// သို့မဟုတ် https:// ဖြင့် စတင်ရပါမည်။ ပြန်လည်ရိုက်ထည့်ပါ 👇")
+        return ADD_SRV_URL
+    
+    context.user_data["srv_url"] = url
+    await update.message.reply_text(
+        "👤 <b>အဆင့် (၃/၅): Panel Username ရိုက်ထည့်ပါ</b> 👇", parse_mode="HTML"
+    )
+    return ADD_SRV_USER
+
+async def srv_receive_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["srv_user"] = update.message.text.strip()
+    await update.message.reply_text(
+        "🔑 <b>အဆင့် (၄/၅): Panel Password ရိုက်ထည့်ပါ</b> 👇", parse_mode="HTML"
+    )
+    return ADD_SRV_PASS
+
+async def srv_receive_pass(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["srv_pass"] = update.message.text.strip()
+    await update.message.reply_text(
+        "🎯 <b>အဆင့် (၅/၅): Inbound ID (ဂဏန်း) ရိုက်ထည့်ပါ</b> 👇\n<i>(များသောအားဖြင့် Reality Inbound ID သည် 1 ဖြစ်သည်)</i>",
+        parse_mode="HTML"
+    )
+    return ADD_SRV_INBOUND
+
+async def srv_receive_inbound(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        inbound_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("⚠️ ကျေးဇူးပြု၍ Inbound ID ကို ဂဏန်းကိန်းဂဏန်းသီးသန့်သာ ရိုက်ထည့်ပါ။ 👇")
+        return ADD_SRV_INBOUND
+    
+    u = context.user_data
+    success, msg = await asyncio.to_thread(
+        add_server_to_db, u["srv_name"], u["srv_url"], u["srv_user"], u["srv_pass"], inbound_id
+    )
+    
+    if success:
+        await update.message.reply_text(f"✅ {msg}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🖥️ ဆာဗာစာရင်းသို့", callback_data="menu:servers")]]))
+    else:
+        await update.message.reply_text(f"❌ {msg}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ပြန်လည်ကြိုးစားမည်", callback_data="menu:servers")]]))
+    return ConversationHandler.END
+
+# ---------------------------------------------------------------------------
+# ၇။ Key စာရင်းနှင့် စီမံခန့်ခွဲမှု (List, Disable, Enable, Edit & Data Usage)
 # ---------------------------------------------------------------------------
 async def show_client_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    clients = await asyncio.to_thread(xui.get_all_clients, INBOUND_ID)
+    srv = context.user_data.get("active_server")
+    if not srv:
+        await query.message.edit_text("⚠️ Active Server ရွေးချယ်ထားခြင်း မရှိပါ။", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🖥️ ဆာဗာရွေးရန်", callback_data="menu:servers")]]))
+        return
+
+    xui = get_client(srv)
+    clients = await asyncio.to_thread(xui.get_all_clients, srv["inbound_id"])
     
     if not clients:
-        await query.message.edit_text("⚠️ <b>လက်ရှိ Inbound ထဲတွင် Key တစ်ခုမှ မရှိသေးပါ။</b>", parse_mode="HTML", reply_markup=get_back_button())
+        await query.message.edit_text(f"⚠️ <b>{srv['name']} တွင်း၌ Key တစ်ခုမှ မရှိသေးပါ။</b>", parse_mode="HTML", reply_markup=get_back_to_dashboard_button())
         return
 
     buttons = []
     for c in clients:
         status_emoji = "🟢" if c.get("enable", False) else "🔴"
         expiry_time = c.get("expiryTime", 0)
-        is_expired = expiry_time > 0 and expiry_time < int(time.time() * 1000)
-        if is_expired: status_emoji = "⚠️(ရက်လွန်)"
+        if expiry_time > 0 and expiry_time < int(time.time() * 1000):
+            status_emoji = "⚠️(ရက်လွန်)"
         
         btn_text = f"{status_emoji} {c.get('email', 'Unnamed')} | Flow: {c.get('flow', 'None') or 'Default'}"
         buttons.append([InlineKeyboardButton(btn_text, callback_data=f"client_detail:{c.get('id')}")])
 
-    buttons.append([InlineKeyboardButton("🏠 ပင်မစာမျက်နှာသို့ ပြန်သွားမည်", callback_data="menu:home")])
-    
+    buttons.append([InlineKeyboardButton("🔙 ဆာဗာ Dashboard သို့ ပြန်သွားမည်", callback_data="menu:dashboard")])
     await query.message.edit_text(
-        "📋 <b>စီမံလိုသော Key အား အောက်ပါစာရင်းမှ ရွေးချယ်ပါ -</b>\n\n<i>(🟢 ဖွင့်ထားသည် | 🔴 ပိတ်ထားသည် | ⚠️ ရက်လွန်)</i>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(buttons)
+        f"📋 <b>{srv['name']} - Key စာရင်းများ -</b>\n\n<i>(🟢 ဖွင့်ထားသည် | 🔴 ပိတ်ထားသည် | ⚠️ ရက်လွန်)</i>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 async def show_client_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, client_uuid: str):
     query = update.callback_query
+    srv = context.user_data.get("active_server")
+    xui = get_client(srv)
     
     try:
-        # Client ရဲ့ Data ကို အရင်လှမ်းယူပါမည်
-        client = await asyncio.to_thread(xui.get_client_by_uuid, INBOUND_ID, client_uuid)
-        
+        client = await asyncio.to_thread(xui.get_client_by_uuid, srv["inbound_id"], client_uuid)
         if not client:
-            await query.message.edit_text("❌ Key အချက်အလက် ရှာမတွေ့ပါ။", reply_markup=get_back_button())
+            await query.message.edit_text("❌ Key အချက်အလက် ရှာမတွေ့ပါ။", reply_markup=get_back_to_dashboard_button())
             return
 
         email = client.get("email", "Unnamed")
-        
-        # ---------------------------------------------------------
-        # အသုံးပြုထားသော Data (GB) ကို တွက်ချက်ခြင်း (API အသစ်အသုံးပြုထားသည်)
-        # ---------------------------------------------------------
         traffic_data = await asyncio.to_thread(xui.get_client_traffic, email)
         used_bytes = int(traffic_data.get("up", 0)) + int(traffic_data.get("down", 0))
         used_gb = round(used_bytes / (1024**3), 2)
-        # ---------------------------------------------------------
 
         flow = client.get("flow", "") or "Default"
         enable = client.get("enable", False)
-        
         expiry_time = int(client.get("expiryTime") or 0)
         total_gb_bytes = int(client.get("totalGB") or 0)
 
@@ -298,20 +475,18 @@ async def show_client_detail(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
         total_gb_str = f"{round(total_gb_bytes / (1024**3), 2)} GB" if total_gb_bytes > 0 else "Unlimited ♾️"
         status_str = "🟢 အသုံးပြုခွင့် ဖွင့်ထားသည် (Enabled)" if enable else "🔴 ပိတ်ထားသည် (Disabled)"
-        
-        vless_link = await asyncio.to_thread(xui.build_vless_link, INBOUND_ID, client_uuid, email, flow)
-
+        vless_link = await asyncio.to_thread(xui.build_vless_link, srv["inbound_id"], client_uuid, email, flow)
         toggle_btn_text = "🔴 ယာယီ ပိတ်မည် (Disable)" if enable else "🟢 ပြန်လည် ဖွင့်မည် (Enable)"
         
         buttons = [
             [InlineKeyboardButton(toggle_btn_text, callback_data=f"toggle:{client_uuid}")],
             [InlineKeyboardButton("✏️ အမည်/သက်တမ်း ပြင်ဆင်မည် (Edit)", callback_data=f"edit_menu:{client_uuid}")],
-            [InlineKeyboardButton("📋 Key စာရင်းသို့ ပြန်သွားမည်", callback_data="menu:list_keys")],
-            [InlineKeyboardButton("🏠 ပင်မစာမျက်နှာသို့", callback_data="menu:home")]
+            [InlineKeyboardButton("📋 Key စာရင်းသို့", callback_data="menu:list_keys")],
+            [InlineKeyboardButton("🔙 ဆာဗာ Dashboard သို့", callback_data="menu:dashboard")]
         ]
 
         msg = (
-            f"👤 <b>Client အချက်အလက် စီမံရန်</b>\n\n"
+            f"👤 <b>Client အချက်အလက် [{srv['name']}]</b>\n\n"
             f"🔹 <b>အမည်:</b> <code>{email}</code>\n"
             f"🔹 <b>အခြေအနေ:</b> {status_str}\n"
             f"⏳ <b>သက်တမ်း:</b> <code>{exp_str}</code>\n"
@@ -321,34 +496,34 @@ async def show_client_detail(update: Update, context: ContextTypes.DEFAULT_TYPE,
             f"📋 <b>VLESS Link:</b>\n<code>{vless_link}</code>"
         )
         await query.message.edit_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
-        
     except Exception as e:
         logger.error(f"Error in show_client_detail: {e}", exc_info=True)
-        await query.message.edit_text(f"⚠️ <b>အမှားအယွင်းဖြစ်ပေါ်နေပါသည်</b>\n\nError Message: <code>{str(e)}</code>", parse_mode="HTML", reply_markup=get_back_button())
+        await query.message.edit_text(f"⚠️ <b>အမှားအယွင်းဖြစ်ပေါ်နေပါသည်</b>\n\nError: <code>{str(e)}</code>", parse_mode="HTML", reply_markup=get_back_to_dashboard_button())
 
 async def toggle_client_status(update: Update, context: ContextTypes.DEFAULT_TYPE, client_uuid: str):
     query = update.callback_query
-    client = await asyncio.to_thread(xui.get_client_by_uuid, INBOUND_ID, client_uuid)
-    if not client:
-        return
+    srv = context.user_data.get("active_server")
+    xui = get_client(srv)
+    
+    client = await asyncio.to_thread(xui.get_client_by_uuid, srv["inbound_id"], client_uuid)
+    if not client: return
     
     client["enable"] = not client.get("enable", False)
-    success, msg = await asyncio.to_thread(xui.update_client, INBOUND_ID, client_uuid, client)
-    
+    success, msg = await asyncio.to_thread(xui.update_client, srv["inbound_id"], client_uuid, client)
     await query.answer(msg)
     await show_client_detail(update, context, client_uuid)
 
 # ---------------------------------------------------------------------------
-# ၇။ Add Key Step-by-Step
+# ၈။ Add Key Wizard (Active Server အတွင်း Key ဆောက်ခြင်း)
 # ---------------------------------------------------------------------------
 async def addkey_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    context.user_data.clear()
+    srv = context.user_data.get("active_server")
     
-    buttons = [[InlineKeyboardButton("❌ လုပ်ဆောင်ချက် ဖျက်သိမ်းမည်", callback_data="menu:home")]]
+    buttons = [[InlineKeyboardButton("❌ လုပ်ဆောင်ချက် ဖျက်သိမ်းမည်", callback_data="menu:dashboard")]]
     await query.message.edit_text(
-        "➕ <b>Key အသစ် ဆောက်လုပ်ခြင်း</b>\n\n"
+        f"➕ <b>Key အသစ် ဆောက်လုပ်ခြင်း [{srv['name']}]</b>\n\n"
         "အဆင့် (၁/၄) : Client အတွက် <b>အမည် (Name / Remarks)</b> ရိုက်ထည့်ပေးပါ 👇\n\n<i>(ဥပမာ - MyPhone, MgMg_Laptop)</i>",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons)
     )
@@ -362,13 +537,12 @@ async def addkey_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE
         [InlineKeyboardButton("♾️ အကန့်အသတ်မရှိ (Unlimited)", callback_data="add_exp:0")],
         [InlineKeyboardButton("၇ ရက်", callback_data="add_exp:7"), InlineKeyboardButton("၃၀ ရက်", callback_data="add_exp:30")],
         [InlineKeyboardButton("၆၀ ရက်", callback_data="add_exp:60"), InlineKeyboardButton("၉၀ ရက်", callback_data="add_exp:90")],
-        [InlineKeyboardButton("❌ ဖျက်သိမ်းမည်", callback_data="menu:home")]
+        [InlineKeyboardButton("❌ ဖျက်သိမ်းမည်", callback_data="menu:dashboard")]
     ]
-    
     await update.message.reply_text(
         f"✅ အမည် <b>{client_name}</b> ကို မှတ်သားပြီးပါပြီ။\n\n"
         "⏳ <b>အဆင့် (၂/၄) : သက်တမ်း ရွေးချယ်ပါ</b>\n\n"
-        "အောက်ပါ ခလုတ်များမှ သက်တမ်း ရက်အရေအတွက် ရွေးချယ်ပါ သို့မဟုတ် ကိုယ်တိုင် ရက်အရေအတွက် ဂဏန်းရိုက်ထည့်ပါ 👇",
+        "ရက်အရေအတွက် ရွေးချယ်ပါ သို့မဟုတ် ကိုယ်တိုင် ဂဏန်းရိုက်ထည့်ပါ 👇",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons)
     )
     return ADD_EXPIRY
@@ -383,7 +557,7 @@ async def addkey_receive_expiry(update: Update, context: ContextTypes.DEFAULT_TY
         try:
             expiry_days = int(update.message.text.strip())
         except ValueError:
-            await update.message.reply_text("⚠️ ကျေးဇူးပြု၍ ရက်အရေအတွက်ကို ဂဏန်းကိန်းဂဏန်းသာ ရိုက်ထည့်ပါ သို့မဟုတ် ခလုတ်ကို နှိပ်ပါ။")
+            await update.message.reply_text("⚠️ ကျေးဇူးပြု၍ ရက်အရေအတွက်ကို ဂဏန်းသီးသန့် ရိုက်ထည့်ပါ သို့မဟုတ် ခလုတ်ကို နှိပ်ပါ။")
             return ADD_EXPIRY
         target_msg = update.message
 
@@ -394,13 +568,12 @@ async def addkey_receive_expiry(update: Update, context: ContextTypes.DEFAULT_TY
         [InlineKeyboardButton("♾️ အကန့်အသတ်မရှိ (Unlimited GB)", callback_data="add_gb:0")],
         [InlineKeyboardButton("10 GB", callback_data="add_gb:10"), InlineKeyboardButton("30 GB", callback_data="add_gb:30")],
         [InlineKeyboardButton("50 GB", callback_data="add_gb:50"), InlineKeyboardButton("100 GB", callback_data="add_gb:100")],
-        [InlineKeyboardButton("❌ ဖျက်သိမ်းမည်", callback_data="menu:home")]
+        [InlineKeyboardButton("❌ ဖျက်သိမ်းမည်", callback_data="menu:dashboard")]
     ]
-    
     await target_msg.reply_text(
         f"✅ သက်တမ်း <b>{expiry_str}</b> သတ်မှတ်ပြီးပါပြီ။\n\n"
         "📊 <b>အဆင့် (၃/၄) : Data Usage Limit (GB) သတ်မှတ်ပါ</b>\n\n"
-        "အောက်ပါ ခလုတ်များမှ ရွေးချယ်ပါ သို့မဟုတ် လိုချင်သော <b>GB ပမာဏကို ဂဏန်းဖြင့် ရိုက်ထည့်ပါ</b> (ဥပမာ - <code>15</code> ဟု ရိုက်လျှင် 15 GB ရမည်) 👇",
+        "ခလုတ်များမှ ရွေးချယ်ပါ သို့မဟုတ် လိုချင်သော <b>GB ပမာဏကို ဂဏန်းဖြင့် ရိုက်ထည့်ပါ</b> 👇",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons)
     )
     return ADD_DATA_LIMIT
@@ -415,7 +588,7 @@ async def addkey_receive_data_limit(update: Update, context: ContextTypes.DEFAUL
         try:
             total_gb = float(update.message.text.strip())
         except ValueError:
-            await update.message.reply_text("⚠️ ကျေးဇူးပြု၍ GB ပမာဏကို ဂဏန်းသီးသန့်သာ ရိုက်ထည့်ပါ (ဥပမာ - <code>15</code> သို့မဟုတ် <code>0.5</code>)။")
+            await update.message.reply_text("⚠️ ကျေးဇူးပြု၍ GB ပမာဏကို ဂဏန်းသီးသန့်သာ ရိုက်ထည့်ပါ။")
             return ADD_DATA_LIMIT
         target_msg = update.message
 
@@ -425,9 +598,8 @@ async def addkey_receive_data_limit(update: Update, context: ContextTypes.DEFAUL
     buttons = [
         [InlineKeyboardButton("⚡ xtls-rprx-vision (Default - အကြံပြုသည်)", callback_data="add_flow:xtls-rprx-vision")],
         [InlineKeyboardButton("⚪ Flow မသုံးပါ (None / Empty)", callback_data="add_flow:")],
-        [InlineKeyboardButton("❌ ဖျက်သိမ်းမည်", callback_data="menu:home")]
+        [InlineKeyboardButton("❌ ဖျက်သိမ်းမည်", callback_data="menu:dashboard")]
     ]
-    
     await target_msg.reply_text(
         f"✅ Data Limit <b>{gb_str}</b> သတ်မှတ်ပြီးပါပြီ။\n\n"
         "⚡ <b>အဆင့် (၄/၄) : Traffic Flow ရွေးချယ်ပါ 👇</b>",
@@ -440,6 +612,9 @@ async def addkey_receive_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     flow = query.data.split(":")[1]
 
+    srv = context.user_data.get("active_server")
+    xui = get_client(srv)
+
     name = context.user_data.get("add_name", "User")
     expiry = context.user_data.get("add_expiry", 0)
     total_gb = context.user_data.get("add_gb", 0)
@@ -447,18 +622,18 @@ async def addkey_receive_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.message.edit_text("⏳ <b>Key ဆောက်လုပ်နေပါသည်...</b> ခဏစောင့်ပေးပါ ခင်ဗျာ။ ⚙️", parse_mode="HTML")
 
     success, uuid_or_err, vless_link = await asyncio.to_thread(
-        xui.add_client, INBOUND_ID, name, expiry, total_gb, flow
+        xui.add_client, srv["inbound_id"], name, expiry, total_gb, flow
     )
 
     if not success:
-        await query.message.edit_text(f"❌ <b>Key ထုတ်ယူခြင်း မအောင်မြင်ပါ</b>\n\n{uuid_or_err}", parse_mode="HTML", reply_markup=get_back_button())
+        await query.message.edit_text(f"❌ <b>Key ထုတ်ယူခြင်း မအောင်မြင်ပါ</b>\n\n{uuid_or_err}", parse_mode="HTML", reply_markup=get_back_to_dashboard_button())
         return ConversationHandler.END
 
     expiry_str = f"{expiry} ရက်" if expiry > 0 else "အကန့်အသတ်မရှိ (Unlimited) ♾️"
     gb_str = f"{total_gb} GB" if total_gb > 0 else "အကန့်အသတ်မရှိ (Unlimited GB) ♾️"
 
     success_msg = (
-        "✅ <b>VLESS + Reality Key ထုတ်ယူခြင်း အောင်မြင်ပါသည်!</b> 🚀\n\n"
+        f"✅ <b>[{srv['name']}] VLESS + Reality Key ထုတ်ယူခြင်း အောင်မြင်ပါသည်!</b> 🚀\n\n"
         f"👤 <b>အမည်:</b> <code>{name}</code>\n"
         f"⏳ <b>သက်တမ်း:</b> <code>{expiry_str}</code>\n"
         f"📊 <b>Data Limit:</b> <code>{gb_str}</code>\n"
@@ -466,23 +641,25 @@ async def addkey_receive_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"📋 <b>VLESS Link (တစ်ချက်နှိပ်၍ Copy ကူးပါ) -</b>\n\n"
         f"<code>{vless_link}</code>"
     )
-    await query.message.edit_text(success_msg, parse_mode="HTML", reply_markup=get_back_button())
+    await query.message.edit_text(success_msg, parse_mode="HTML", reply_markup=get_back_to_dashboard_button())
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
-# ၈။ Edit Key Handlers
+# ၉။ Edit Key Handlers
 # ---------------------------------------------------------------------------
 async def show_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, client_uuid: str):
     query = update.callback_query
     context.user_data["edit_uuid"] = client_uuid
-    client = await asyncio.to_thread(xui.get_client_by_uuid, INBOUND_ID, client_uuid)
+    srv = context.user_data.get("active_server")
+    xui = get_client(srv)
+    client = await asyncio.to_thread(xui.get_client_by_uuid, srv["inbound_id"], client_uuid)
     
     buttons = [
         [InlineKeyboardButton("⏳ သက်တမ်း ရက်တိုးရန် / ပြင်ဆင်ရန်", callback_data=f"edit_act:expiry:{client_uuid}")],
         [InlineKeyboardButton("👤 အမည် (Name/Remarks) ပြောင်းရန်", callback_data=f"edit_act:name:{client_uuid}")],
         [InlineKeyboardButton("⚡ Flow (xtls-rprx-vision) ပြောင်းရန်", callback_data=f"edit_act:flow:{client_uuid}")],
         [InlineKeyboardButton("🔙 နောက်သို့ ပြန်သွားမည်", callback_data=f"client_detail:{client_uuid}")],
-        [InlineKeyboardButton("🏠 ပင်မစာမျက်နှာသို့", callback_data="menu:home")]
+        [InlineKeyboardButton("🔙 Dashboard သို့", callback_data="menu:dashboard")]
     ]
     await query.message.edit_text(
         f"✏️ <b>{client.get('email')}</b> အတွက် ပြင်ဆင်လိုသည့် အပိုင်းကို ရွေးချယ်ပါ 👇",
@@ -495,24 +672,26 @@ async def edit_action_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
     parts = query.data.split(":")
     action, client_uuid = parts[1], parts[2]
     context.user_data["edit_uuid"] = client_uuid
-    client = await asyncio.to_thread(xui.get_client_by_uuid, INBOUND_ID, client_uuid)
+    srv = context.user_data.get("active_server")
+    xui = get_client(srv)
+    client = await asyncio.to_thread(xui.get_client_by_uuid, srv["inbound_id"], client_uuid)
 
     if action == "expiry":
         buttons = [
             [InlineKeyboardButton("➕ ၇ ရက် တိုးမည်", callback_data="edit_exp_add:7"), InlineKeyboardButton("➕ ၃၀ ရက် တိုးမည်", callback_data="edit_exp_add:30")],
             [InlineKeyboardButton("♾️ အကန့်အသတ်မရှိ ပြောင်းမည် (Unlimited)", callback_data="edit_exp_set:0")],
-            [InlineKeyboardButton("🔙 နောက်သို့", callback_data=f"edit_menu:{client_uuid}"), InlineKeyboardButton("🏠 ပင်မသို့", callback_data="menu:home")]
+            [InlineKeyboardButton("🔙 နောက်သို့", callback_data=f"edit_menu:{client_uuid}")]
         ]
         await query.message.edit_text(
-            f"⏳ <b>{client.get('email')}</b> အတွက် ရက်တိုးရန် ခလုတ်နှိပ်ပါ၊ သို့မဟုတ် သတ်မှတ်လိုသည့် ရက်ပေါင်းအသစ်ကို ဂဏန်းဖြင့် ရိုက်ထည့်ပါ 👇",
+            f"⏳ <b>{client.get('email')}</b> အတွက် ရက်တိုးရန် ခလုတ်နှိပ်ပါ သို့မဟုတ် ကိုယ်တိုင် ဂဏန်းရိုက်ထည့်ပါ 👇",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons)
         )
         return EDIT_EXPIRY_INPUT
 
     elif action == "name":
-        buttons = [[InlineKeyboardButton("🔙 နောက်သို့", callback_data=f"edit_menu:{client_uuid}"), InlineKeyboardButton("🏠 ပင်မသို့", callback_data="menu:home")]]
+        buttons = [[InlineKeyboardButton("🔙 နောက်သို့", callback_data=f"edit_menu:{client_uuid}")]]
         await query.message.edit_text(
-            f"👤 <b>{client.get('email')}</b> အတွက် အမည်အသစ် (New Name) ရိုက်ထည့်ပေးပါ 👇",
+            f"👤 <b>{client.get('email')}</b> အတွက် အမည်အသစ် ရိုက်ထည့်ပေးပါ 👇",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons)
         )
         return EDIT_NAME_INPUT
@@ -520,14 +699,16 @@ async def edit_action_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif action == "flow":
         new_flow = "xtls-rprx-vision" if not client.get("flow") else ""
         client["flow"] = new_flow
-        success, msg = await asyncio.to_thread(xui.update_client, INBOUND_ID, client_uuid, client)
+        success, msg = await asyncio.to_thread(xui.update_client, srv["inbound_id"], client_uuid, client)
         await query.answer(msg)
         await show_client_detail(update, context, client_uuid)
         return ConversationHandler.END
 
 async def edit_receive_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     client_uuid = context.user_data.get("edit_uuid")
-    client = await asyncio.to_thread(xui.get_client_by_uuid, INBOUND_ID, client_uuid)
+    srv = context.user_data.get("active_server")
+    xui = get_client(srv)
+    client = await asyncio.to_thread(xui.get_client_by_uuid, srv["inbound_id"], client_uuid)
     
     if update.callback_query:
         query = update.callback_query
@@ -550,30 +731,47 @@ async def edit_receive_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE
             return EDIT_EXPIRY_INPUT
 
     client["enable"] = True
-    success, msg = await asyncio.to_thread(xui.update_client, INBOUND_ID, client_uuid, client)
-    
-    await target_msg.reply_text(f"✅ သက်တမ်း ပြင်ဆင်ပြီးပါပြီ။ {msg}", reply_markup=get_back_button())
+    success, msg = await asyncio.to_thread(xui.update_client, srv["inbound_id"], client_uuid, client)
+    await target_msg.reply_text(f"✅ သက်တမ်း ပြင်ဆင်ပြီးပါပြီ။ {msg}", reply_markup=get_back_to_dashboard_button())
     return ConversationHandler.END
 
 async def edit_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     client_uuid = context.user_data.get("edit_uuid")
-    client = await asyncio.to_thread(xui.get_client_by_uuid, INBOUND_ID, client_uuid)
+    srv = context.user_data.get("active_server")
+    xui = get_client(srv)
+    client = await asyncio.to_thread(xui.get_client_by_uuid, srv["inbound_id"], client_uuid)
     
     new_name = update.message.text.strip().replace(" ", "_")
     client["email"] = new_name
-    success, msg = await asyncio.to_thread(xui.update_client, INBOUND_ID, client_uuid, client)
-    
-    await update.message.reply_text(f"✅ အမည်အသစ် <b>{new_name}</b> သို့ ပြောင်းလဲပြီးပါပြီ။", parse_mode="HTML", reply_markup=get_back_button())
+    success, msg = await asyncio.to_thread(xui.update_client, srv["inbound_id"], client_uuid, client)
+    await update.message.reply_text(f"✅ အမည်အသစ် <b>{new_name}</b> သို့ ပြောင်းလဲပြီးပါပြီ။", parse_mode="HTML", reply_markup=get_back_to_dashboard_button())
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
-# ၉။ Main Application Setup
+# ၁၀။ Main Application Setup
 # ---------------------------------------------------------------------------
 def main():
-    logger.info("🚀 Starting Button-Driven 3x-ui Bot...")
+    init_db()  # Initialize SQLite Table
+    logger.info("🚀 Starting 3x-ui Multi-Server Bot...")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    add_conv = ConversationHandler(
+    add_srv_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(srv_add_start, pattern="^srv_add$"),
+            CommandHandler("start", start_command)
+        ],
+        states={
+            ADD_SRV_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, srv_receive_name)],
+            ADD_SRV_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, srv_receive_url)],
+            ADD_SRV_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, srv_receive_user)],
+            ADD_SRV_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, srv_receive_pass)],
+            ADD_SRV_INBOUND: [MessageHandler(filters.TEXT & ~filters.COMMAND, srv_receive_inbound)]
+        },
+        fallbacks=[CallbackQueryHandler(menu_router, pattern="^menu:servers$")],
+        allow_reentry=True
+    )
+
+    add_key_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(addkey_start, pattern="^menu:add_key$")],
         states={
             ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, addkey_receive_name)],
@@ -587,11 +785,11 @@ def main():
             ],
             ADD_FLOW: [CallbackQueryHandler(addkey_receive_flow, pattern="^add_flow:")]
         },
-        fallbacks=[CallbackQueryHandler(menu_router, pattern="^menu:home$")],
+        fallbacks=[CallbackQueryHandler(menu_router, pattern="^menu:dashboard$")],
         allow_reentry=True
     )
 
-    edit_conv = ConversationHandler(
+    edit_key_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(edit_action_router, pattern="^edit_act:")],
         states={
             EDIT_EXPIRY_INPUT: [
@@ -600,16 +798,17 @@ def main():
             ],
             EDIT_NAME_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_receive_name)]
         },
-        fallbacks=[CallbackQueryHandler(menu_router, pattern="^menu:home$")],
+        fallbacks=[CallbackQueryHandler(menu_router, pattern="^menu:dashboard$")],
         allow_reentry=True
     )
 
-    app.add_handler(add_conv)
-    app.add_handler(edit_conv)
+    app.add_handler(add_srv_conv)
+    app.add_handler(add_key_conv)
+    app.add_handler(edit_key_conv)
     app.add_handler(CommandHandler(["start", "help", "menu"], start_command))
     app.add_handler(CallbackQueryHandler(menu_router))
 
-    logger.info("✅ Bot is online and listening for button clicks...")
+    logger.info("✅ Bot is online and ready for multiple servers!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
