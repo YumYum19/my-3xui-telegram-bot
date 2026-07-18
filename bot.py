@@ -261,7 +261,7 @@ def get_back_to_dashboard_button():
     ])
 
 # ---------------------------------------------------------------------------
-# ၅။ Startup & Server Selection Flow (Loop Bug Fixed)
+# ၅။ Startup & Server Selection Flow
 # ---------------------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
@@ -360,7 +360,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await delete_client_action(update, context, data.split(":")[1])
 
 # ---------------------------------------------------------------------------
-# ၆။ Add Server Wizard (With Strict Admin Check)
+# ၆။ Add Server Wizard (With Safe Generic Examples)
 # ---------------------------------------------------------------------------
 async def srv_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
@@ -370,7 +370,7 @@ async def srv_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     
     await query.message.edit_text(
         "➕ <b>ဆာဗာအသစ် ထည့်သွင်းခြင်း (၁/၅)</b>\n\n"
-        "ကျေးဇူးပြု၍ ဆာဗာအတွက် <b>အမည် (Server Name)</b> ရိုက်ထည့်ပေးပါ 👇\n<i>(ဥပမာ - SG-Server-1)</i>",
+        "ကျေးဇူးပြု၍ ဆာဗာအတွက် <b>အမည် (Server Name)</b> ရိုက်ထည့်ပေးပါ 👇\n<i>(ဥပမာ - SG-Server-1, US-Premium)</i>",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ဖျက်သိမ်းမည်", callback_data="menu:servers")]])
     )
     return ADD_SRV_NAME
@@ -381,7 +381,7 @@ async def srv_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text(
         f"✅ ဆာဗာအမည် <b>{context.user_data['srv_name']}</b> မှတ်သားပြီးပါပြီ။\n\n"
         "🔗 <b>အဆင့် (၂/၅): 3x-ui Panel Link ရိုက်ထည့်ပါ</b> 👇\n"
-        "<i>(ဥပမာ - http://167.172.73.82:53073/KycDj1Uzisw3vpu)</i>",
+        "<i>(ဥပမာ - http://198.51.100.1:54321/secret_path)</i>",
         parse_mode="HTML"
     )
     return ADD_SRV_URL
@@ -394,13 +394,21 @@ async def srv_receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return ADD_SRV_URL
     
     context.user_data["srv_url"] = url
-    await update.message.reply_text("👤 <b>အဆင့် (၃/၅): Panel Username ရိုက်ထည့်ပါ</b> 👇", parse_mode="HTML")
+    await update.message.reply_text(
+        "👤 <b>အဆင့် (၃/၅): Panel Username ရိုက်ထည့်ပါ</b> 👇\n"
+        "<i>(ဥပမာ - admin_user)</i>",
+        parse_mode="HTML"
+    )
     return ADD_SRV_USER
 
 async def srv_receive_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
     context.user_data["srv_user"] = update.message.text.strip()
-    await update.message.reply_text("🔑 <b>အဆင့် (၄/၅): Panel Password ရိုက်ထည့်ပါ</b> 👇", parse_mode="HTML")
+    await update.message.reply_text(
+        "🔑 <b>အဆင့် (၄/၅): Panel Password ရိုက်ထည့်ပါ</b> 👇\n"
+        "<i>(ဥပမာ - StrongPass123!)</i>",
+        parse_mode="HTML"
+    )
     return ADD_SRV_PASS
 
 async def srv_receive_pass(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -432,7 +440,7 @@ async def srv_receive_inbound(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
-# ၇။ Key စာရင်းနှင့် စီမံခန့်ခွဲမှု (With Admin Check, Delete Key & Safe Errors)
+# ၇။ Key စာရင်းနှင့် စီမံခန့်ခွဲမှု
 # ---------------------------------------------------------------------------
 async def show_client_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID: return
@@ -549,7 +557,7 @@ async def delete_client_action(update: Update, context: ContextTypes.DEFAULT_TYP
     await show_client_list(update, context)
 
 # ---------------------------------------------------------------------------
-# ၈။ Add Key Wizard (With Strict Admin Check)
+# ၈။ Add Key Wizard
 # ---------------------------------------------------------------------------
 async def addkey_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
@@ -685,7 +693,7 @@ async def addkey_receive_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
-# ၉။ Edit Key Handlers (With Strict Admin Check & Delete Key)
+# ၉။ Edit Key Handlers
 # ---------------------------------------------------------------------------
 async def show_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, client_uuid: str):
     if update.effective_user.id != ADMIN_TELEGRAM_ID: return
