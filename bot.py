@@ -194,6 +194,12 @@ class XUIClient:
             return True, "✅ ပြင်ဆင်မှု အောင်မြင်ပါသည်။"
         return False, f"❌ ပြင်ဆင်မှု မအောင်မြင်ပါ: {res.get('msg', 'Unknown')}"
 
+    def delete_client(self, inbound_id: int, client_uuid: str) -> tuple[bool, str]:
+        res = self._request("POST", f"/panel/api/inbounds/{inbound_id}/delClient/{client_uuid}")
+        if res.get("success"):
+            return True, "✅ Key ကို အပြီးတိုင် ဖျက်သိမ်းပြီးပါပြီ။"
+        return False, f"❌ ဖျက်သိမ်းမှု မအောင်မြင်ပါ: {res.get('msg', 'Unknown Server Error')}"
+
     def build_vless_link(self, inbound_id: int, client_uuid: str, email: str, flow: str) -> str:
         parsed = urlparse(self.base_url)
         vps_ip = parsed.hostname or "127.0.0.1"
@@ -283,7 +289,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.message.edit_text(msg, parse_mode="HTML", reply_markup=get_server_list_keyboard(servers))
     return ConversationHandler.END
 
-# Loop Bug မဖြစ်စေရန် Dashboard ပြသသည့် အပိုင်းကို သီးသန့်ခွဲထုတ်ထားသည်
 async def show_server_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, srv: dict):
     msg = (
         f"📌 <b>Active Server Dashboard</b>\n\n"
@@ -323,7 +328,6 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         context.user_data["active_server"] = srv
-        # Dashboard သို့ တိုက်ရိုက်ခေါ်ပေးခြင်းဖြင့် Infinite Loop ဖြစ်ခြင်းကို တားဆီးသည်
         await show_server_dashboard(update, context, srv)
 
     elif data == "srv_del_menu":
@@ -351,6 +355,9 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("edit_menu:"):
         await show_edit_menu(update, context, data.split(":")[1])
+
+    elif data.startswith("del_client:"):
+        await delete_client_action(update, context, data.split(":")[1])
 
 # ---------------------------------------------------------------------------
 # ၆။ Add Server Wizard (With Strict Admin Check)
@@ -425,7 +432,7 @@ async def srv_receive_inbound(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
-# ၇။ Key စာရင်းနှင့် စီမံခန့်ခွဲမှု (With Admin Check & Safe Errors)
+# ၇။ Key စာရင်းနှင့် စီမံခန့်ခွဲမှု (With Admin Check, Delete Key & Safe Errors)
 # ---------------------------------------------------------------------------
 async def show_client_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID: return
@@ -497,6 +504,7 @@ async def show_client_detail(update: Update, context: ContextTypes.DEFAULT_TYPE,
         buttons = [
             [InlineKeyboardButton(toggle_btn_text, callback_data=f"toggle:{client_uuid}")],
             [InlineKeyboardButton("✏️ အမည်/သက်တမ်း ပြင်ဆင်မည် (Edit)", callback_data=f"edit_menu:{client_uuid}")],
+            [InlineKeyboardButton("🗑️ Key ကို အပြီးတိုင် ဖျက်သိမ်းမည် (Delete)", callback_data=f"del_client:{client_uuid}")],
             [InlineKeyboardButton("📋 Key စာရင်းသို့", callback_data="menu:list_keys")],
             [InlineKeyboardButton("🔙 ဆာဗာ Dashboard သို့", callback_data="menu:dashboard")]
         ]
@@ -514,7 +522,6 @@ async def show_client_detail(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await query.message.edit_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
     except Exception as e:
         logger.error(f"Error in show_client_detail: {e}", exc_info=True)
-        # Safe Error Output (Internal code output များကို မဖော်ပြတော့ပါ)
         await query.message.edit_text("⚠️ <b>ဆာဗာချိတ်ဆက်မှု အမှားအယွင်းဖြစ်ပေါ်နေပါသည်။</b>\n\n ကျေးဇူးပြု၍ ခဏစောင့်ပြီး ပြန်လည်ကြိုးစားပါ။", parse_mode="HTML", reply_markup=get_back_to_dashboard_button())
 
 async def toggle_client_status(update: Update, context: ContextTypes.DEFAULT_TYPE, client_uuid: str):
@@ -530,6 +537,16 @@ async def toggle_client_status(update: Update, context: ContextTypes.DEFAULT_TYP
     success, msg = await asyncio.to_thread(xui.update_client, srv["inbound_id"], client_uuid, client)
     await query.answer(msg)
     await show_client_detail(update, context, client_uuid)
+
+async def delete_client_action(update: Update, context: ContextTypes.DEFAULT_TYPE, client_uuid: str):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return
+    query = update.callback_query
+    srv = context.user_data.get("active_server")
+    xui = get_client(srv)
+    
+    success, msg = await asyncio.to_thread(xui.delete_client, srv["inbound_id"], client_uuid)
+    await query.answer(msg, show_alert=True)
+    await show_client_list(update, context)
 
 # ---------------------------------------------------------------------------
 # ၈။ Add Key Wizard (With Strict Admin Check)
@@ -668,7 +685,7 @@ async def addkey_receive_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
-# ၉။ Edit Key Handlers (With Strict Admin Check)
+# ၉။ Edit Key Handlers (With Strict Admin Check & Delete Key)
 # ---------------------------------------------------------------------------
 async def show_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, client_uuid: str):
     if update.effective_user.id != ADMIN_TELEGRAM_ID: return
@@ -682,6 +699,7 @@ async def show_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, cli
         [InlineKeyboardButton("⏳ သက်တမ်း ရက်တိုးရန် / ပြင်ဆင်ရန်", callback_data=f"edit_act:expiry:{client_uuid}")],
         [InlineKeyboardButton("👤 အမည် (Name/Remarks) ပြောင်းရန်", callback_data=f"edit_act:name:{client_uuid}")],
         [InlineKeyboardButton("⚡ Flow (xtls-rprx-vision) ပြောင်းရန်", callback_data=f"edit_act:flow:{client_uuid}")],
+        [InlineKeyboardButton("🗑️ Key ကို အပြီးတိုင် ဖျက်သိမ်းမည် (Delete)", callback_data=f"del_client:{client_uuid}")],
         [InlineKeyboardButton("🔙 နောက်သို့ ပြန်သွားမည်", callback_data=f"client_detail:{client_uuid}")],
         [InlineKeyboardButton("🔙 Dashboard သို့", callback_data="menu:dashboard")]
     ]
@@ -782,7 +800,6 @@ def main():
     logger.info("🚀 Starting Security-Hardened 3x-ui Multi-Server Bot...")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Apply Admin checks via handler logic to strictly block unauthorized access
     add_srv_conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(srv_add_start, pattern="^srv_add$"),
