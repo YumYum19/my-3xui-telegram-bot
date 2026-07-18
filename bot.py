@@ -19,15 +19,20 @@ from telegram.ext import (
 )
 
 # ---------------------------------------------------------------------------
-# ၁။ Logging & Environment Setup
+# ၁။ Logging & Strict Environment Setup (Security Hardened)
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8993287223:AAHnmFVfJTHkTURQNsFZeZJtRk1REfB5NEg")
-ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", 1824573670))
+# Fallback Credentials များကို ဖယ်ရှားထားပါသည်။ Railway Variables တွင် မထည့်ပါက ချက်ချင်း Crash ဖြစ်ပါမည်။
+try:
+    TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+    ADMIN_TELEGRAM_ID = int(os.environ["ADMIN_TELEGRAM_ID"])
+except (KeyError, ValueError) as e:
+    logger.critical("❌ CRITICAL ERROR: TELEGRAM_BOT_TOKEN သို့မဟုတ် ADMIN_TELEGRAM_ID ကို Railway Variables တွင် မှန်ကန်စွာ မထည့်သွင်းထားပါ။")
+    raise SystemExit("Environment variables missing or invalid.")
 
 # Conversation States
 (
@@ -79,7 +84,8 @@ def add_server_to_db(name: str, url: str, username: str, password: str, inbound_
     except sqlite3.IntegrityError:
         return False, "ဤဆာဗာအမည်ဖြင့် သိမ်းဆည်းထားပြီး ဖြစ်နေပါသည်။ အမည်ပြောင်း၍ ပြန်ကြိုးစားပါ။"
     except Exception as e:
-        return False, f"Database အမှား - {str(e)}"
+        logger.error(f"Database Error: {e}")
+        return False, "Database အမှားအယွင်း ဖြစ်ပေါ်နေပါသည်။"
 
 def delete_server_from_db(server_id: int) -> bool:
     with sqlite3.connect(DB_FILE) as conn:
@@ -131,11 +137,12 @@ class XUIClient:
                     try:
                         return res.json()
                     except Exception:
-                        return {"success": False, "msg": f"Server Response Error: {res.text[:50]}"}
+                        return {"success": False, "msg": "Server Response Error"}
                 else:
                     return {"success": False, "msg": "Re-authentication failed."}
         except Exception as e:
-            return {"success": False, "msg": f"Request Error: {str(e)}"}
+            logger.error(f"API Request Error: {e}")
+            return {"success": False, "msg": "Network Error Occurred."}
 
     def get_inbound(self, inbound_id: int) -> dict:
         data = self._request("GET", f"/panel/api/inbounds/get/{inbound_id}")
@@ -248,7 +255,7 @@ def get_back_to_dashboard_button():
     ])
 
 # ---------------------------------------------------------------------------
-# ၅။ Startup & Server Selection Flow
+# ၅။ Startup & Server Selection Flow (Loop Bug Fixed)
 # ---------------------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
@@ -256,10 +263,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     servers = await asyncio.to_thread(get_all_servers)
     
-    # ဆာဗာ လုံးဝမရှိသေးပါက Add Server Wizard သို့ အလိုအလျောက် ပို့မည်
     if not servers:
         msg = (
-            "🚀 <b>3x-ui Multi-Server Manager</b> သို့ ကြိုဆိုပါသည်!\n\n"
+            "🚀 <b>3x-ui Multi-Server Manager</b>\n\n"
             "⚠️ <b>လက်ရှိတွင် ဆာဗာတစ်ခုမှ မရှိသေးပါ။</b>\n\n"
             "ကျေးဇူးပြု၍ ပထမဆုံး ဆာဗာအတွက် <b>ဆာဗာအမည် (Server Name)</b> ရိုက်ထည့်ပေးပါ 👇\n"
             "<i>(ဥပမာ - SG-Server-1, US-Premium)</i>"
@@ -270,13 +276,26 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.callback_query.message.edit_text(msg, parse_mode="HTML")
         return ADD_SRV_NAME
 
-    # ဆာဗာရှိပြီးသားဖြစ်ပါက Menu ပြမည်
     msg = "🚀 <b>3x-ui Multi-Server Manager</b>\n\nစီမံလိုသော ဆာဗာကို အောက်ပါစာရင်းမှ ရွေးချယ်ပါ 👇"
     if update.message:
         await update.message.reply_text(msg, parse_mode="HTML", reply_markup=get_server_list_keyboard(servers))
     elif update.callback_query:
         await update.callback_query.message.edit_text(msg, parse_mode="HTML", reply_markup=get_server_list_keyboard(servers))
     return ConversationHandler.END
+
+# Loop Bug မဖြစ်စေရန် Dashboard ပြသသည့် အပိုင်းကို သီးသန့်ခွဲထုတ်ထားသည်
+async def show_server_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE, srv: dict):
+    msg = (
+        f"📌 <b>Active Server Dashboard</b>\n\n"
+        f"🖥️ <b>ဆာဗာ:</b> <code>{srv['name']}</code>\n"
+        f"🔗 <b>Link:</b> <code>{srv['url']}</code>\n"
+        f"🎯 <b>Inbound ID:</b> <code>{srv['inbound_id']}</code>\n\n"
+        f"အောက်ပါ လုပ်ဆောင်ချက်များမှ တစ်ခု ရွေးချယ်ပါ 👇"
+    )
+    if update.callback_query:
+        await update.callback_query.message.edit_text(msg, parse_mode="HTML", reply_markup=get_dashboard_keyboard())
+    elif update.message:
+        await update.message.reply_text(msg, parse_mode="HTML", reply_markup=get_dashboard_keyboard())
 
 async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -294,15 +313,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not srv:
             await start_command(update, context)
             return ConversationHandler.END
-        
-        msg = (
-            f"📌 <b>Active Server Dashboard</b>\n\n"
-            f"🖥️ <b>ဆာဗာ:</b> <code>{srv['name']}</code>\n"
-            f"🔗 <b>Link:</b> <code>{srv['url']}</code>\n"
-            f"🎯 <b>Inbound ID:</b> <code>{srv['inbound_id']}</code>\n\n"
-            f"အောက်ပါ လုပ်ဆောင်ချက်များမှ တစ်ခု ရွေးချယ်ပါ 👇"
-        )
-        await query.message.edit_text(msg, parse_mode="HTML", reply_markup=get_dashboard_keyboard())
+        await show_server_dashboard(update, context, srv)
 
     elif data.startswith("srv_sel:"):
         srv_id = int(data.split(":")[1])
@@ -312,7 +323,8 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         context.user_data["active_server"] = srv
-        await menu_router(update, context)  # Dashboard သို့ ပြန်ခေါ်မည်
+        # Dashboard သို့ တိုက်ရိုက်ခေါ်ပေးခြင်းဖြင့် Infinite Loop ဖြစ်ခြင်းကို တားဆီးသည်
+        await show_server_dashboard(update, context, srv)
 
     elif data == "srv_del_menu":
         servers = await asyncio.to_thread(get_all_servers)
@@ -341,9 +353,10 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_edit_menu(update, context, data.split(":")[1])
 
 # ---------------------------------------------------------------------------
-# ၆။ Add Server Wizard (ဆာဗာအသစ် ထည့်သွင်းခြင်း)
+# ၆။ Add Server Wizard (With Strict Admin Check)
 # ---------------------------------------------------------------------------
 async def srv_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
     query = update.callback_query
     await query.answer()
     context.user_data.clear()
@@ -356,6 +369,7 @@ async def srv_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ADD_SRV_NAME
 
 async def srv_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
     context.user_data["srv_name"] = update.message.text.strip()
     await update.message.reply_text(
         f"✅ ဆာဗာအမည် <b>{context.user_data['srv_name']}</b> မှတ်သားပြီးပါပြီ။\n\n"
@@ -366,25 +380,24 @@ async def srv_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return ADD_SRV_URL
 
 async def srv_receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
     url = update.message.text.strip().rstrip("/")
     if not url.startswith("http://") and not url.startswith("https://"):
         await update.message.reply_text("⚠️ Link URL သည် http:// သို့မဟုတ် https:// ဖြင့် စတင်ရပါမည်။ ပြန်လည်ရိုက်ထည့်ပါ 👇")
         return ADD_SRV_URL
     
     context.user_data["srv_url"] = url
-    await update.message.reply_text(
-        "👤 <b>အဆင့် (၃/၅): Panel Username ရိုက်ထည့်ပါ</b> 👇", parse_mode="HTML"
-    )
+    await update.message.reply_text("👤 <b>အဆင့် (၃/၅): Panel Username ရိုက်ထည့်ပါ</b> 👇", parse_mode="HTML")
     return ADD_SRV_USER
 
 async def srv_receive_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
     context.user_data["srv_user"] = update.message.text.strip()
-    await update.message.reply_text(
-        "🔑 <b>အဆင့် (၄/၅): Panel Password ရိုက်ထည့်ပါ</b> 👇", parse_mode="HTML"
-    )
+    await update.message.reply_text("🔑 <b>အဆင့် (၄/၅): Panel Password ရိုက်ထည့်ပါ</b> 👇", parse_mode="HTML")
     return ADD_SRV_PASS
 
 async def srv_receive_pass(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
     context.user_data["srv_pass"] = update.message.text.strip()
     await update.message.reply_text(
         "🎯 <b>အဆင့် (၅/၅): Inbound ID (ဂဏန်း) ရိုက်ထည့်ပါ</b> 👇\n<i>(များသောအားဖြင့် Reality Inbound ID သည် 1 ဖြစ်သည်)</i>",
@@ -393,6 +406,7 @@ async def srv_receive_pass(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return ADD_SRV_INBOUND
 
 async def srv_receive_inbound(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
     try:
         inbound_id = int(update.message.text.strip())
     except ValueError:
@@ -411,9 +425,10 @@ async def srv_receive_inbound(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
-# ၇။ Key စာရင်းနှင့် စီမံခန့်ခွဲမှု (List, Disable, Enable, Edit & Data Usage)
+# ၇။ Key စာရင်းနှင့် စီမံခန့်ခွဲမှု (With Admin Check & Safe Errors)
 # ---------------------------------------------------------------------------
 async def show_client_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return
     query = update.callback_query
     srv = context.user_data.get("active_server")
     if not srv:
@@ -444,6 +459,7 @@ async def show_client_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def show_client_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, client_uuid: str):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return
     query = update.callback_query
     srv = context.user_data.get("active_server")
     xui = get_client(srv)
@@ -498,9 +514,11 @@ async def show_client_detail(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await query.message.edit_text(msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
     except Exception as e:
         logger.error(f"Error in show_client_detail: {e}", exc_info=True)
-        await query.message.edit_text(f"⚠️ <b>အမှားအယွင်းဖြစ်ပေါ်နေပါသည်</b>\n\nError: <code>{str(e)}</code>", parse_mode="HTML", reply_markup=get_back_to_dashboard_button())
+        # Safe Error Output (Internal code output များကို မဖော်ပြတော့ပါ)
+        await query.message.edit_text("⚠️ <b>ဆာဗာချိတ်ဆက်မှု အမှားအယွင်းဖြစ်ပေါ်နေပါသည်။</b>\n\n ကျေးဇူးပြု၍ ခဏစောင့်ပြီး ပြန်လည်ကြိုးစားပါ။", parse_mode="HTML", reply_markup=get_back_to_dashboard_button())
 
 async def toggle_client_status(update: Update, context: ContextTypes.DEFAULT_TYPE, client_uuid: str):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return
     query = update.callback_query
     srv = context.user_data.get("active_server")
     xui = get_client(srv)
@@ -514,9 +532,10 @@ async def toggle_client_status(update: Update, context: ContextTypes.DEFAULT_TYP
     await show_client_detail(update, context, client_uuid)
 
 # ---------------------------------------------------------------------------
-# ၈။ Add Key Wizard (Active Server အတွင်း Key ဆောက်ခြင်း)
+# ၈။ Add Key Wizard (With Strict Admin Check)
 # ---------------------------------------------------------------------------
 async def addkey_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
     query = update.callback_query
     await query.answer()
     srv = context.user_data.get("active_server")
@@ -530,6 +549,7 @@ async def addkey_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return ADD_NAME
 
 async def addkey_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
     client_name = update.message.text.strip().replace(" ", "_")
     context.user_data["add_name"] = client_name
     
@@ -548,6 +568,7 @@ async def addkey_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ADD_EXPIRY
 
 async def addkey_receive_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
     if update.callback_query:
         query = update.callback_query
         await query.answer()
@@ -579,6 +600,7 @@ async def addkey_receive_expiry(update: Update, context: ContextTypes.DEFAULT_TY
     return ADD_DATA_LIMIT
 
 async def addkey_receive_data_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
     if update.callback_query:
         query = update.callback_query
         await query.answer()
@@ -608,6 +630,7 @@ async def addkey_receive_data_limit(update: Update, context: ContextTypes.DEFAUL
     return ADD_FLOW
 
 async def addkey_receive_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
     query = update.callback_query
     await query.answer()
     flow = query.data.split(":")[1]
@@ -645,9 +668,10 @@ async def addkey_receive_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
-# ၉။ Edit Key Handlers
+# ၉။ Edit Key Handlers (With Strict Admin Check)
 # ---------------------------------------------------------------------------
 async def show_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, client_uuid: str):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return
     query = update.callback_query
     context.user_data["edit_uuid"] = client_uuid
     srv = context.user_data.get("active_server")
@@ -667,6 +691,7 @@ async def show_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, cli
     )
 
 async def edit_action_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
     query = update.callback_query
     await query.answer()
     parts = query.data.split(":")
@@ -705,6 +730,7 @@ async def edit_action_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
 
 async def edit_receive_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
     client_uuid = context.user_data.get("edit_uuid")
     srv = context.user_data.get("active_server")
     xui = get_client(srv)
@@ -736,6 +762,7 @@ async def edit_receive_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 async def edit_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
     client_uuid = context.user_data.get("edit_uuid")
     srv = context.user_data.get("active_server")
     xui = get_client(srv)
@@ -752,9 +779,10 @@ async def edit_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ---------------------------------------------------------------------------
 def main():
     init_db()  # Initialize SQLite Table
-    logger.info("🚀 Starting 3x-ui Multi-Server Bot...")
+    logger.info("🚀 Starting Security-Hardened 3x-ui Multi-Server Bot...")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # Apply Admin checks via handler logic to strictly block unauthorized access
     add_srv_conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(srv_add_start, pattern="^srv_add$"),
@@ -808,7 +836,7 @@ def main():
     app.add_handler(CommandHandler(["start", "help", "menu"], start_command))
     app.add_handler(CallbackQueryHandler(menu_router))
 
-    logger.info("✅ Bot is online and ready for multiple servers!")
+    logger.info("✅ Bot is online, secured, and ready for deployment!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
