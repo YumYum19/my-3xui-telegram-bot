@@ -261,7 +261,7 @@ def get_client(server_data: dict) -> XUIClient:
     return active_xui_clients[s_id]
 
 # ---------------------------------------------------------------------------
-# ၄။ Auto Install SSH Script (Upgraded & Robust Key Generation)
+# ၄။ Auto Install SSH Script (With Uninstall & Direct Binary Execution)
 # ---------------------------------------------------------------------------
 def exec_ssh_command(ssh: paramiko.SSHClient, command: str, timeout: int = 300) -> tuple[int, str]:
     """Execute SSH commands with continuous buffer reading to prevent hangs/deadlocks."""
@@ -290,11 +290,21 @@ def auto_install_and_setup(ip: str, password: str) -> tuple[bool, str, dict]:
         logger.info(f"Connecting via SSH to {clean_ip}...")
         ssh.connect(clean_ip, port=22, username='root', password=password, timeout=30, banner_timeout=30)
         
+        # 1. အဆင့် (၀) - x-ui အဟောင်းရှိပါက အပြီးတိုင် ရှင်းလင်းခြင်း (Clean Uninstall)
+        logger.info("Uninstalling and cleaning up old x-ui installation...")
+        uninstall_cmd = (
+            'systemctl stop x-ui 2>/dev/null; '
+            'systemctl disable x-ui 2>/dev/null; '
+            'rm -rf /usr/local/x-ui /etc/x-ui /etc/systemd/system/x-ui.service /usr/bin/x-ui /usr/local/bin/x-ui; '
+            'systemctl daemon-reload 2>/dev/null;'
+        )
+        exec_ssh_command(ssh, uninstall_cmd, timeout=60)
+
         panel_user = f"admin{random.randint(100, 999)}"
         panel_pass = f"pass{random.randint(1000, 9999)}"
         panel_port = random.randint(10000, 50000)
         
-        # 1. Non-interactive installation using official 3x-ui environment variables
+        # 2. အဆင့် (၁) - သင်ပေးပို့သော v2.5.8 Pinned Version ဖြင့် တပ်ဆင်ခြင်း
         install_cmd = (
             'export DEBIAN_FRONTEND=noninteractive && '
             'apt-get update -y && '
@@ -304,10 +314,11 @@ def auto_install_and_setup(ip: str, password: str) -> tuple[bool, str, dict]:
             f'export XUI_PASSWORD="{panel_pass}" && '
             f'export XUI_PANEL_PORT="{panel_port}" && '
             'export XUI_WEB_BASE_PATH="" && '
-            'bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)'
+            'export VERSION="v2.5.8" && '
+            'bash <(curl -Ls "https://raw.githubusercontent.com/mhsanaei/3x-ui/$VERSION/install.sh") $VERSION'
         )
         
-        logger.info(f"Running non-interactive 3x-ui installation on {clean_ip}...")
+        logger.info(f"Running v2.5.8 3x-ui installation on {clean_ip}...")
         exit_status, install_output = exec_ssh_command(ssh, install_cmd, timeout=300)
         
         if exit_status != 0:
@@ -315,23 +326,23 @@ def auto_install_and_setup(ip: str, password: str) -> tuple[bool, str, dict]:
             ssh.close()
             return False, f"3x-ui တပ်ဆင်မှု မအောင်မြင်ပါ (Exit Code: {exit_status})။ VPS OS အားစစ်ဆေးပါ။", {}
         
-        # 2. Ensure service is running and extract x25519 reality keys robustly
+        # 3. အဆင့် (၂) - Menu wrapper ကိုကျော်ပြီး Xray Binary ဖြင့် x25519 key တိုက်ရိုက်ထုတ်ယူခြင်း
         exec_ssh_command(ssh, "systemctl daemon-reload 2>/dev/null; systemctl enable --now x-ui 2>/dev/null; sleep 3;")
         
-        # Comprehensive binary search across all possible paths
+        # CPU Architecture အလိုက် Xray root binary ကို တိုက်ရိုက် လှမ်းခေါ်သော စနစ်
         x25519_cmd = (
-            'export PATH=$PATH:/usr/local/bin:/usr/bin:/usr/local/x-ui:/usr/local/x-ui/bin; '
-            'if command -v x-ui >/dev/null 2>&1; then x-ui x25519; '
-            'elif [ -f /usr/local/x-ui/x-ui.sh ]; then bash /usr/local/x-ui/x-ui.sh x25519; '
+            'ARCH=$(uname -m); '
+            'if [ "$ARCH" = "x86_64" ]; then BIN="/usr/local/x-ui/bin/xray-linux-amd64"; '
+            'elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then BIN="/usr/local/x-ui/bin/xray-linux-arm64"; '
+            'else BIN=$(find /usr/local/x-ui/ -name "xray*" -type f | head -n 1); fi; '
+            'if [ -f "$BIN" ]; then chmod +x "$BIN" && "$BIN" x25519; '
             'else '
-            'XRAY_BIN=$(find /usr/ -name "xray*" -type f 2>/dev/null | head -n 1); '
-            'if [ -n "$XRAY_BIN" ]; then chmod +x "$XRAY_BIN" && "$XRAY_BIN" x25519; '
-            'else echo "ERROR_XRAY_BINARY_NOT_FOUND"; fi; '
+            'XRAY_ANY=$(find / -name "xray*" -type f 2>/dev/null | grep -v "/proc" | head -n 1); '
+            'chmod +x "$XRAY_ANY" && "$XRAY_ANY" x25519; '
             'fi'
         )
         _, key_output = exec_ssh_command(ssh, x25519_cmd)
         
-        # Remove ANSI color escape sequences from terminal output before regex matching
         ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0?]*[ -/]*[@-~])')
         clean_output = ansi_escape.sub('', key_output)
         
@@ -344,7 +355,7 @@ def auto_install_and_setup(ip: str, password: str) -> tuple[bool, str, dict]:
         prv_key = prv_match.group(1).strip()
         ssh.close()
         
-        # 3. Connect via API with retry loop (VPS startup can take up to 30-40s)
+        # 4. အဆင့် (၃) - API သို့ ချိတ်ဆက်ခြင်း
         base_url = f"http://{clean_ip}:{panel_port}"
         xui = XUIClient(base_url, panel_user, panel_pass)
         
