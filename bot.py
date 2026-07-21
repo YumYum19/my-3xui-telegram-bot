@@ -5,8 +5,6 @@ import time
 import logging
 import asyncio
 import requests
-import paramiko
-import random
 import re
 from urllib.parse import urlparse, quote
 
@@ -42,11 +40,10 @@ except KeyError as e:
     raise SystemExit("Environment variables missing. Setup Railway Variables.")
 
 (
-    AUTO_IP, AUTO_PASS, AUTO_NAME,
     ADD_SRV_NAME, ADD_SRV_URL, ADD_SRV_USER, ADD_SRV_PASS, ADD_SRV_INBOUND,
     ADD_NAME, ADD_EXPIRY, ADD_DATA_LIMIT, ADD_FLOW,
     EDIT_EXPIRY_INPUT, EDIT_NAME_INPUT
-) = range(14)
+) = range(11)
 
 # ---------------------------------------------------------------------------
 # ၂။ Database Setup (PostgreSQL)
@@ -144,7 +141,7 @@ class XUIClient:
 
     def _request(self, method: str, endpoint: str, **kwargs) -> dict:
         if not self.is_logged_in and not self.login():
-            return {"success": False, "msg": "Auth failed."}
+            return {"success": False, "msg": "Auth failed. Check Panel URL, Username, or Password."}
         url = f"{self.base_url}{endpoint}"
         try:
             res = self.session.request(method, url, timeout=10, **kwargs)
@@ -183,25 +180,6 @@ class XUIClient:
     def get_client_traffic(self, email: str) -> dict:
         data = self._request("GET", f"/panel/api/inbounds/getClientTraffics/{email}")
         return data.get("obj", {}) if data.get("success") else {}
-
-    def add_inbound_reality(self, remark: str, port: int, prv_key: str, short_id: str) -> dict:
-        payload = {
-            "up": 0, "down": 0, "total": 0, "remark": remark, "enable": True, "expiryTime": 0, "listen": "",
-            "port": port, "protocol": "vless",
-            "settings": json.dumps({"clients": [], "decryption": "none", "fallbacks": []}),
-            "streamSettings": json.dumps({
-                "network": "tcp", "security": "reality",
-                "realitySettings": {
-                    "show": False, "dest": "www.amazon.com:443", "xver": 0,
-                    "serverNames": ["www.amazon.com", "amazon.com"],
-                    "privateKey": prv_key, "minClientVer": "", "maxClientVer": "",
-                    "maxTimeDiff": 0, "shortIds": [short_id]
-                },
-                "tcpSettings": {"acceptProxyProtocol": False, "header": {"type": "none"}}
-            }),
-            "sniffing": json.dumps({"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": False})
-        }
-        return self._request("POST", "/panel/api/inbounds/add", json=payload)
 
     def add_client(self, inbound_id: int, email: str, expiry_days: int, total_gb: float, flow: str) -> tuple[bool, str, str]:
         client_uuid = str(uuid.uuid4())
@@ -261,159 +239,7 @@ def get_client(server_data: dict) -> XUIClient:
     return active_xui_clients[s_id]
 
 # ---------------------------------------------------------------------------
-# ၄။ Auto Install SSH Script (With Auto-Firewall & Local Health Check)
-# ---------------------------------------------------------------------------
-def exec_ssh_command(ssh: paramiko.SSHClient, command: str, timeout: int = 300) -> tuple[int, str]:
-    """Execute SSH commands with continuous buffer reading to prevent hangs/deadlocks."""
-    stdin, stdout, stderr = ssh.exec_command(command, get_pty=True, timeout=timeout)
-    stdin.close()
-    
-    output_lines = []
-    while not stdout.channel.exit_status_ready():
-        if stdout.channel.recv_ready():
-            output_lines.append(stdout.channel.recv(4096).decode('utf-8', errors='ignore'))
-        time.sleep(0.1)
-        
-    while stdout.channel.recv_ready():
-        output_lines.append(stdout.channel.recv(4096).decode('utf-8', errors='ignore'))
-        
-    exit_status = stdout.channel.recv_exit_status()
-    return exit_status, "".join(output_lines)
-
-def auto_install_and_setup(ip: str, password: str) -> tuple[bool, str, dict]:
-    try:
-        clean_ip = ip.strip().replace("http://", "").replace("https://", "").split("/")[0].split(":")[0]
-        
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        
-        logger.info(f"Connecting via SSH to {clean_ip}...")
-        ssh.connect(clean_ip, port=22, username='root', password=password, timeout=30, banner_timeout=30)
-        
-        # 1. အဆင့် (၀) - x-ui အဟောင်းရှိပါက အပြီးတိုင် ရှင်းလင်းခြင်း (Clean Uninstall)
-        logger.info("Uninstalling and cleaning up old x-ui installation...")
-        uninstall_cmd = (
-            'systemctl stop x-ui 2>/dev/null; '
-            'systemctl disable x-ui 2>/dev/null; '
-            'rm -rf /usr/local/x-ui /etc/x-ui /etc/systemd/system/x-ui.service /usr/bin/x-ui /usr/local/bin/x-ui; '
-            'systemctl daemon-reload 2>/dev/null;'
-        )
-        exec_ssh_command(ssh, uninstall_cmd, timeout=60)
-
-        panel_user = f"admin{random.randint(100, 999)}"
-        panel_pass = f"pass{random.randint(1000, 9999)}"
-        panel_port = random.randint(10000, 50000)
-        
-        # 2. အဆင့် (၁) - v2.5.8 ၏ Interactive Prompts များကို echo -e piped ဖြင့် အလိုအလျောက် ဖြေကြားတပ်ဆင်ခြင်း
-        install_cmd = (
-            'export DEBIAN_FRONTEND=noninteractive && '
-            'apt-get update -y && '
-            'apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" curl sqlite3 ca-certificates tar ufw iptables && '
-            'export VERSION="v2.5.8" && '
-            f'echo -e "y\\n{panel_user}\\n{panel_pass}\\n{panel_port}\\n" | bash <(curl -Ls "https://raw.githubusercontent.com/mhsanaei/3x-ui/$VERSION/install.sh") $VERSION'
-        )
-        
-        logger.info(f"Running v2.5.8 3x-ui installation on {clean_ip}...")
-        exit_status, install_output = exec_ssh_command(ssh, install_cmd, timeout=300)
-        
-        if exit_status != 0:
-            logger.error(f"Install failed on {clean_ip}: {install_output[-500:]}")
-            ssh.close()
-            return False, f"3x-ui တပ်ဆင်မှု မအောင်မြင်ပါ (Exit Code: {exit_status})။ VPS OS အားစစ်ဆေးပါ။", {}
-        
-        # 3. အဆင့် (၂) - Firewall (ufw & iptables) တွင် Panel Port နှင့် VLESS Port 443 ကို Auto ဖွင့်ပေးခြင်း
-        logger.info(f"Configuring local firewall for port {panel_port} and 443...")
-        firewall_cmd = (
-            f"ufw allow {panel_port}/tcp 2>/dev/null; "
-            f"ufw allow 443/tcp 2>/dev/null; "
-            f"iptables -I INPUT -p tcp --dport {panel_port} -j ACCEPT 2>/dev/null; "
-            f"iptables -I INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null; "
-            f"ip6tables -I INPUT -p tcp --dport {panel_port} -j ACCEPT 2>/dev/null; "
-            f"ip6tables -I INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null; "
-            f"systemctl daemon-reload 2>/dev/null; systemctl enable --now x-ui 2>/dev/null; sleep 3;"
-        )
-        exec_ssh_command(ssh, firewall_cmd)
-
-        # 4. အဆင့် (၃) - Xray Binary ဖြင့် x25519 key တိုက်ရိုက်ထုတ်ယူခြင်း
-        x25519_cmd = (
-            'ARCH=$(uname -m); '
-            'if [ "$ARCH" = "x86_64" ]; then BIN="/usr/local/x-ui/bin/xray-linux-amd64"; '
-            'elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then BIN="/usr/local/x-ui/bin/xray-linux-arm64"; '
-            'else BIN=$(find /usr/local/x-ui/ -name "xray*" -type f | head -n 1); fi; '
-            'if [ -f "$BIN" ]; then chmod +x "$BIN" && "$BIN" x25519; '
-            'else '
-            'XRAY_ANY=$(find / -name "xray*" -type f 2>/dev/null | grep -v "/proc" | head -n 1); '
-            'chmod +x "$XRAY_ANY" && "$XRAY_ANY" x25519; '
-            'fi'
-        )
-        _, key_output = exec_ssh_command(ssh, x25519_cmd)
-        
-        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0?]*[ -/]*[@-~])')
-        clean_output = ansi_escape.sub('', key_output)
-        
-        prv_match = re.search(r'Private\s*key\s*:\s*([a-zA-Z0-9_\-=]+)', clean_output, re.IGNORECASE)
-        if not prv_match:
-            ssh.close()
-            err_detail = clean_output.strip() if clean_output.strip() else "No output returned from xray binary."
-            return False, f"x25519 Reality Keys generate လုပ်၍မရပါ။\n[Output Details]: <code>{err_detail[:250]}</code>", {}
-            
-        prv_key = prv_match.group(1).strip()
-        
-        # Localhost Health Check (VPS အတွင်းမှာ Panel တကယ် အလုပ်လုပ်/မလုပ် အရင်စစ်ဆေးခြင်း)
-        _, local_check = exec_ssh_command(ssh, f"curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{panel_port}/login")
-        is_locally_running = (local_check.strip() in ["200", "405", "302", "301"])
-        ssh.close()
-        
-        # 5. အဆင့် (၄) - API သို့ ချိတ်ဆက်ခြင်း
-        base_url = f"http://{clean_ip}:{panel_port}"
-        xui = XUIClient(base_url, panel_user, panel_pass)
-        
-        logger.info(f"Connecting to 3x-ui API at {base_url}...")
-        api_connected = False
-        for attempt in range(8):
-            time.sleep(5)
-            if xui.login():
-                api_connected = True
-                break
-            logger.info(f"API login attempt {attempt+1} failed, retrying in 5s...")
-            
-        if not api_connected:
-            if is_locally_running:
-                return False, (
-                    f"⚠️ <b>Panel တပ်ဆင်မှု အောင်မြင်သော်လည်း အပြင်မှ API ဝင်ရောက်၍မရပါ။</b>\n\n"
-                    f"ဆာဗာအတွင်း၌ Panel သည် Port <code>{panel_port}</code> တွင် ပုံမှန်အလုပ်လုပ်နေပါသည်။ သို့သော် သင်၏ Cloud Provider (AWS, Oracle, DigitalOcean, Alibaba စသည်) ၏ **Security Group / Virtual Cloud Network Firewall** တွင် Inbound Port မဖွင့်ရသေးသောကြောင့် ဖြစ်ပါသည်။\n\n"
-                    f"👉 ကျေးဇူးပြု၍ Cloud Dashboard သို့ ဝင်ရောက်ပြီး <b>TCP Port <code>{panel_port}</code></b> နှင့် <b><code>443</code></b> ကို Inbound Open လုပ်ပေးပြီးမှ ထပ်မံကြိုးစားပါ။"
-                ), {}
-            else:
-                return False, "Panel တပ်ဆင်မှု ပြီးစီးသော်လည်း x-ui service စတင်အလုပ်မလုပ်ပါ။ VPS RAM သို့မဟုတ် Disk Space မလောက်ခြင်း ဖြစ်နိုင်ပါသည်။", {}
-            
-        short_id = os.urandom(4).hex()
-        inbound_port = 443
-        
-        res = xui.add_inbound_reality("Auto_VLESS_Reality", inbound_port, prv_key, short_id)
-        if not res.get("success"):
-            return False, f"Reality Inbound တည်ဆောက်၍မရပါ: {res.get('msg')}", {}
-            
-        inbounds = xui.get_inbound_list()
-        inbound_id = inbounds[-1].get("id", 1) if inbounds else 1
-
-        return True, "Success", {
-            "url": base_url,
-            "user": panel_user,
-            "pass": panel_pass,
-            "inbound_id": inbound_id
-        }
-
-    except paramiko.AuthenticationException:
-        return False, "SSH Root Password မှားယွင်းနေပါသည်။ ပတ်စ်ဝါဒ် ပြန်လည်စစ်ဆေးပါ။", {}
-    except paramiko.SSHException as e:
-        return False, f"SSH Connection Error: {e}", {}
-    except Exception as e:
-        logger.error(f"Auto setup unexpected error: {e}", exc_info=True)
-        return False, f"System Error: {e}", {}
-
-# ---------------------------------------------------------------------------
-# ၅။ UI & Handlers
+# ၄။ UI & Handlers
 # ---------------------------------------------------------------------------
 def get_admin_main_keyboard():
     return InlineKeyboardMarkup([
@@ -425,8 +251,7 @@ def get_server_list_keyboard(servers: list[dict]):
     for srv in servers:
         buttons.append([InlineKeyboardButton(f"🖥️ {srv['name']}", callback_data=f"srv_sel:{srv['id']}")])
     
-    buttons.append([InlineKeyboardButton("⚡ Auto-Setup ဖြင့် ထည့်မည်", callback_data="auto_setup_start")])
-    buttons.append([InlineKeyboardButton("➕ ကိုယ်တိုင် (Manual) ထည့်မည်", callback_data="srv_add")])
+    buttons.append([InlineKeyboardButton("➕ ဆာဗာအသစ် ထည့်မည် (Add Server)", callback_data="srv_add")])
     
     if servers:
         buttons.append([InlineKeyboardButton("🗑️ ဆာဗာများ ဖျက်သိမ်းရန်", callback_data="srv_del_menu")])
@@ -507,75 +332,14 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("del_client:"): await delete_client_action(update, context, data.split(":")[1])
 
 # ---------------------------------------------------------------------------
-# ၆။ Auto Setup Flow
-# ---------------------------------------------------------------------------
-async def auto_setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
-    query = update.callback_query; await query.answer()
-    context.user_data.clear()
-    
-    await query.message.edit_text(
-        "⚡ <b>IP ဖြင့် ဆာဗာကို အလိုအလျောက် တပ်ဆင်ခြင်း</b>\n\n"
-        "ကျေးဇူးပြု၍ ဆာဗာ၏ <b>IP Address</b> ကို ရိုက်ထည့်ပေးပါ 👇\n<i>(ဥပမာ - 198.51.100.1)</i>",
-        parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ဖျက်သိမ်းမည်", callback_data="menu:servers")]])
-    )
-    return AUTO_IP
-
-async def auto_setup_receive_ip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
-    context.user_data["setup_ip"] = update.message.text.strip()
-    await update.message.reply_text("🔑 <b>VPS ၏ Root Password ကို ရိုက်ထည့်ပေးပါ</b> 👇", parse_mode="HTML")
-    return AUTO_PASS
-
-async def auto_setup_process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
-    ip = context.user_data["setup_ip"]
-    password = update.message.text.strip()
-    
-    msg_handle = await update.message.reply_text("⏳ <b>ဆာဗာထဲသို့ ဝင်ရောက်၍ 3x-ui Panel အား အလိုအလျောက် တပ်ဆင်နေပါသည်... (မိနစ်အနည်းငယ် ကြာနိုင်ပါသည်)</b>", parse_mode="HTML")
-    
-    success, msg, data = await asyncio.to_thread(auto_install_and_setup, ip, password)
-    
-    if not success:
-        await msg_handle.edit_text(f"❌ <b>တပ်ဆင်မှု မအောင်မြင်ပါ။</b>\n\n{msg}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ပြန်လည်ကြိုးစားမည်", callback_data="menu:servers")]]))
-        return ConversationHandler.END
-
-    context.user_data["setup_data"] = data
-    
-    success_msg = (
-        f"✅ <b>ဆာဗာ တပ်ဆင်မှု အောင်မြင်ပါသည်!</b>\n\n"
-        f"<b>- ပထမအဆင့် အချက်အလက်များ -</b>\n"
-        f"🔗 URL: <code>{data['url']}</code>\n"
-        f"👤 User: <code>{data['user']}</code>\n"
-        f"🔑 Pass: <code>{data['pass']}</code>\n"
-        f"🎯 Inbound: <code>{data['inbound_id']}</code>\n\n"
-        f"<b>ဒုတိယအဆင့် -</b> ဤဆာဗာကို မှတ်သားထားရန် <b>ဆာဗာအမည် (Server Name)</b> ကို ယခု ရိုက်ထည့်ပေးပါ 👇\n<i>(ဥပမာ - SG-Server-1)</i>"
-    )
-    await msg_handle.edit_text(success_msg, parse_mode="HTML")
-    return AUTO_NAME
-
-async def auto_setup_save_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
-    name = update.message.text.strip()
-    data = context.user_data["setup_data"]
-    
-    success, msg = await asyncio.to_thread(add_server_to_db, name, data["url"], data["user"], data["pass"], data["inbound_id"])
-    
-    if success:
-        await update.message.reply_text(f"✅ <b>တတိယအဆင့် - ဆာဗာအမည် \"{name}\" ဖြင့် Database တွင် အမြဲတမ်း သိမ်းဆည်းပြီးပါပြီ!</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🖥️ ဆာဗာစာရင်းသို့", callback_data="menu:servers")]]))
-    else:
-        await update.message.reply_text(f"❌ {msg}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ပြန်လည်ကြိုးစားမည်", callback_data="menu:servers")]]))
-    return ConversationHandler.END
-
-# ---------------------------------------------------------------------------
-# ၇။ Manual Add Server Flow
+# ၅။ Manual Add Server Flow
 # ---------------------------------------------------------------------------
 async def srv_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
     query = update.callback_query; await query.answer()
     context.user_data.clear()
     await query.message.edit_text(
-        "➕ <b>ဆာဗာအသစ် ကိုယ်တိုင်ထည့်သွင်းခြင်း (၁/၅)</b>\n\n"
+        "➕ <b>ဆာဗာအသစ် ထည့်သွင်းခြင်း (၁/၅)</b>\n\n"
         "ကျေးဇူးပြု၍ ဆာဗာအတွက် <b>အမည် (Server Name)</b> ရိုက်ထည့်ပေးပါ 👇\n<i>(ဥပမာ - SG-Server-1)</i>",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ဖျက်သိမ်းမည်", callback_data="menu:servers")]])
     )
@@ -631,7 +395,7 @@ async def srv_receive_inbound(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
-# ၈။ Key Management
+# ၆။ Key Management
 # ---------------------------------------------------------------------------
 async def show_client_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID: return
@@ -671,7 +435,7 @@ async def show_client_detail(update: Update, context: ContextTypes.DEFAULT_TYPE,
             [InlineKeyboardButton("🔙 Dashboard သို့", callback_data="menu:dashboard")]
         ]
         await query.message.edit_text(f"👤 <b>Key Detail [{srv['name']}]</b>\n\n🔹 <b>အမည်:</b> <code>{email}</code>\n🔹 <b>အခြေအနေ:</b> {'🟢 ဖွင့်' if enable else '🔴 ပိတ်'}\n⏳ <b>သက်တမ်း:</b> <code>{exp_str}</code>\n📊 <b>Data Limit:</b> <code>{total_gb_str}</code>\n📈 <b>သုံးပြီး Data:</b> <code>{used_gb} GB</code>\n⚡ <b>Flow:</b> <code>{flow}</code>\n\n📋 <b>VLESS Link:</b>\n<code>{vless_link}</code>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
-    except Exception: await query.message.edit_text("⚠️ ဆာဗာ အမှားအယွင်းဖြစ်နေပါသည်။", reply_markup=get_back_to_dashboard_button())
+    except Exception: await query.message.edit_text("⚠️ ဆာဗာ အမှားအယွင်းဖြစ်နေပါသည်။ Check Panel connection.", reply_markup=get_back_to_dashboard_button())
 
 async def toggle_client_status(update: Update, context: ContextTypes.DEFAULT_TYPE, client_uuid: str):
     if update.effective_user.id != ADMIN_TELEGRAM_ID: return
@@ -794,23 +558,12 @@ async def edit_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
-# ၉။ Main Initialization
+# ၇။ Main Initialization
 # ---------------------------------------------------------------------------
 def main():
     init_db()
-    logger.info("🚀 Starting Personal VPN Admin Bot with Auto-Setup...")
+    logger.info("🚀 Starting Personal VPN Admin Bot (Manual Server Mode)...")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    auto_setup_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(auto_setup_start, pattern="^auto_setup_start$")],
-        states={
-            AUTO_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, auto_setup_receive_ip)],
-            AUTO_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, auto_setup_process)],
-            AUTO_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, auto_setup_save_name)]
-        },
-        fallbacks=[CallbackQueryHandler(menu_router, pattern="^menu:servers$")],
-        allow_reentry=True
-    )
 
     manual_setup_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(srv_add_start, pattern="^srv_add$")],
@@ -847,7 +600,6 @@ def main():
         allow_reentry=True
     )
 
-    app.add_handler(auto_setup_conv)
     app.add_handler(manual_setup_conv)
     app.add_handler(add_key_conv)
     app.add_handler(edit_key_conv)
@@ -856,7 +608,7 @@ def main():
     app.add_handler(CallbackQueryHandler(start_command, pattern="^admin_main$"))
     app.add_handler(CallbackQueryHandler(menu_router))
 
-    logger.info("✅ Bot is online!")
+    logger.info("✅ Bot is online and ready for manual servers!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
