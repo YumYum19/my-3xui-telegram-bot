@@ -43,9 +43,10 @@ except KeyError as e:
 
 (
     AUTO_IP, AUTO_PASS, AUTO_NAME,
+    ADD_SRV_NAME, ADD_SRV_URL, ADD_SRV_USER, ADD_SRV_PASS, ADD_SRV_INBOUND,
     ADD_NAME, ADD_EXPIRY, ADD_DATA_LIMIT, ADD_FLOW,
     EDIT_EXPIRY_INPUT, EDIT_NAME_INPUT
-) = range(9)
+) = range(14)
 
 # ---------------------------------------------------------------------------
 # ၂။ Database Setup (PostgreSQL)
@@ -323,7 +324,11 @@ def get_server_list_keyboard(servers: list[dict]):
     buttons = []
     for srv in servers:
         buttons.append([InlineKeyboardButton(f"🖥️ {srv['name']}", callback_data=f"srv_sel:{srv['id']}")])
-    buttons.append([InlineKeyboardButton("⚡ IP ဖြင့် အလိုအလျောက် ဆာဗာသွင်းမည်", callback_data="auto_setup_start")])
+    
+    # ရွေးချယ်စရာ (၂) ခု ထည့်ထားပါသည်
+    buttons.append([InlineKeyboardButton("⚡ Auto-Setup ဖြင့် ထည့်မည်", callback_data="auto_setup_start")])
+    buttons.append([InlineKeyboardButton("➕ ကိုယ်တိုင် (Manual) ထည့်မည်", callback_data="srv_add")])
+    
     if servers:
         buttons.append([InlineKeyboardButton("🗑️ ဆာဗာများ ဖျက်သိမ်းရန်", callback_data="srv_del_menu")])
     buttons.append([InlineKeyboardButton("🔙 Main Menu သို့", callback_data="admin_main")])
@@ -464,7 +469,70 @@ async def auto_setup_save_name(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
-# ၇။ Key Management
+# ၇။ Manual Add Server Flow
+# ---------------------------------------------------------------------------
+async def srv_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
+    query = update.callback_query; await query.answer()
+    context.user_data.clear()
+    await query.message.edit_text(
+        "➕ <b>ဆာဗာအသစ် ကိုယ်တိုင်ထည့်သွင်းခြင်း (၁/၅)</b>\n\n"
+        "ကျေးဇူးပြု၍ ဆာဗာအတွက် <b>အမည် (Server Name)</b> ရိုက်ထည့်ပေးပါ 👇\n<i>(ဥပမာ - SG-Server-1)</i>",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ဖျက်သိမ်းမည်", callback_data="menu:servers")]])
+    )
+    return ADD_SRV_NAME
+
+async def srv_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
+    context.user_data["srv_name"] = update.message.text.strip()
+    await update.message.reply_text(
+        f"✅ ဆာဗာအမည် <b>{context.user_data['srv_name']}</b> မှတ်သားပြီးပါပြီ။\n\n"
+        "🔗 <b>အဆင့် (၂/၅): 3x-ui Panel Link ရိုက်ထည့်ပါ</b> 👇\n"
+        "<i>(ဥပမာ - http://198.51.100.1:54321/secret_path)</i>",
+        parse_mode="HTML"
+    )
+    return ADD_SRV_URL
+
+async def srv_receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
+    url = update.message.text.strip().rstrip("/")
+    if not url.startswith("http://") and not url.startswith("https://"):
+        await update.message.reply_text("⚠️ Link URL သည် http:// သို့မဟုတ် https:// ဖြင့် စတင်ရပါမည်။ ပြန်လည်ရိုက်ထည့်ပါ 👇")
+        return ADD_SRV_URL
+    context.user_data["srv_url"] = url
+    await update.message.reply_text("👤 <b>အဆင့် (၃/၅): Panel Username ရိုက်ထည့်ပါ</b> 👇", parse_mode="HTML")
+    return ADD_SRV_USER
+
+async def srv_receive_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
+    context.user_data["srv_user"] = update.message.text.strip()
+    await update.message.reply_text("🔑 <b>အဆင့် (၄/၅): Panel Password ရိုက်ထည့်ပါ</b> 👇", parse_mode="HTML")
+    return ADD_SRV_PASS
+
+async def srv_receive_pass(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
+    context.user_data["srv_pass"] = update.message.text.strip()
+    await update.message.reply_text("🎯 <b>အဆင့် (၅/၅): Inbound ID (ဂဏန်း) ရိုက်ထည့်ပါ</b> 👇", parse_mode="HTML")
+    return ADD_SRV_INBOUND
+
+async def srv_receive_inbound(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != ADMIN_TELEGRAM_ID: return ConversationHandler.END
+    try: inbound_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("⚠️ ကျေးဇူးပြု၍ Inbound ID ကို ဂဏန်းသီးသန့်သာ ရိုက်ထည့်ပါ။ 👇")
+        return ADD_SRV_INBOUND
+    
+    u = context.user_data
+    success, msg = await asyncio.to_thread(add_server_to_db, u["srv_name"], u["srv_url"], u["srv_user"], u["srv_pass"], inbound_id)
+    
+    if success:
+        await update.message.reply_text(f"✅ {msg}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🖥️ ဆာဗာစာရင်းသို့", callback_data="menu:servers")]]))
+    else:
+        await update.message.reply_text(f"❌ {msg}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ပြန်လည်ကြိုးစားမည်", callback_data="menu:servers")]]))
+    return ConversationHandler.END
+
+# ---------------------------------------------------------------------------
+# ၈။ Key Management
 # ---------------------------------------------------------------------------
 async def show_client_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID: return
@@ -627,7 +695,7 @@ async def edit_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return ConversationHandler.END
 
 # ---------------------------------------------------------------------------
-# ၈။ Main Initialization
+# ၉။ Main Initialization
 # ---------------------------------------------------------------------------
 def main():
     init_db()
@@ -640,6 +708,19 @@ def main():
             AUTO_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, auto_setup_receive_ip)],
             AUTO_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, auto_setup_process)],
             AUTO_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, auto_setup_save_name)]
+        },
+        fallbacks=[CallbackQueryHandler(menu_router, pattern="^menu:servers$")],
+        allow_reentry=True
+    )
+
+    manual_setup_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(srv_add_start, pattern="^srv_add$")],
+        states={
+            ADD_SRV_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, srv_receive_name)],
+            ADD_SRV_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, srv_receive_url)],
+            ADD_SRV_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, srv_receive_user)],
+            ADD_SRV_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, srv_receive_pass)],
+            ADD_SRV_INBOUND: [MessageHandler(filters.TEXT & ~filters.COMMAND, srv_receive_inbound)]
         },
         fallbacks=[CallbackQueryHandler(menu_router, pattern="^menu:servers$")],
         allow_reentry=True
@@ -668,6 +749,7 @@ def main():
     )
 
     app.add_handler(auto_setup_conv)
+    app.add_handler(manual_setup_conv)
     app.add_handler(add_key_conv)
     app.add_handler(edit_key_conv)
     
