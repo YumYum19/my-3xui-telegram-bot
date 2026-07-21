@@ -135,21 +135,27 @@ class XUIClient:
         payload = {"username": self.username, "password": self.password}
         try:
             res = self.session.post(url, data=payload, timeout=10)
-            if res.json().get("success", False):
+            if res.status_code == 200 and res.json().get("success", False):
                 self.is_logged_in = True
                 return True
-        except Exception: pass
+        except Exception as e:
+            logger.debug(f"Login failed for {self.base_url}: {e}")
         return False
 
     def _request(self, method: str, endpoint: str, **kwargs) -> dict:
-        if not self.is_logged_in and not self.login(): return {"success": False, "msg": "Auth failed."}
+        if not self.is_logged_in and not self.login():
+            return {"success": False, "msg": "Auth failed."}
         url = f"{self.base_url}{endpoint}"
         try:
             res = self.session.request(method, url, timeout=10, **kwargs)
             return res.json()
         except Exception:
-            if self.login(): return self.session.request(method, url, timeout=10, **kwargs).json()
-            return {"success": False, "msg": "Network error."}
+            if self.login():
+                try:
+                    return self.session.request(method, url, timeout=10, **kwargs).json()
+                except Exception as e:
+                    return {"success": False, "msg": f"Request error: {e}"}
+            return {"success": False, "msg": "Network or auth error."}
             
     def get_inbound_list(self) -> list:
         data = self._request("GET", "/panel/api/inbounds/list")
@@ -163,7 +169,9 @@ class XUIClient:
         inbound = self.get_inbound(inbound_id)
         if not inbound: return []
         settings = inbound.get("settings", {})
-        if isinstance(settings, str): settings = json.loads(settings)
+        if isinstance(settings, str):
+            try: settings = json.loads(settings)
+            except Exception: return []
         return settings.get("clients", [])
 
     def get_client_by_uuid(self, inbound_id: int, client_uuid: str) -> dict:
@@ -198,7 +206,7 @@ class XUIClient:
     def add_client(self, inbound_id: int, email: str, expiry_days: int, total_gb: float, flow: str) -> tuple[bool, str, str]:
         client_uuid = str(uuid.uuid4())
         expiry_time = 0 if expiry_days <= 0 else int((time.time() + (expiry_days * 86400)) * 1000)
-        total_bytes = 0 if total_gb <= 0 else int(total_gb * 1024 * 1024 * 1024)
+        total_bytes = 0 if total_gb <= 0 else int(total_gb * (1024**3))
 
         client_data = {
             "id": client_uuid, "flow": flow, "email": email,
@@ -253,53 +261,96 @@ def get_client(server_data: dict) -> XUIClient:
     return active_xui_clients[s_id]
 
 # ---------------------------------------------------------------------------
-# ၄။ Auto Install SSH Script
+# ၄။ Auto Install SSH Script (Upgraded & Deadlock-Free)
 # ---------------------------------------------------------------------------
+def exec_ssh_command(ssh: paramiko.SSHClient, command: str, timeout: int = 300) -> tuple[int, str]:
+    """Execute SSH commands with continuous buffer reading to prevent hangs/deadlocks."""
+    stdin, stdout, stderr = ssh.exec_command(command, get_pty=True, timeout=timeout)
+    stdin.close()
+    
+    output_lines = []
+    while not stdout.channel.exit_status_ready():
+        if stdout.channel.recv_ready():
+            output_lines.append(stdout.channel.recv(4096).decode('utf-8', errors='ignore'))
+        time.sleep(0.1)
+        
+    while stdout.channel.recv_ready():
+        output_lines.append(stdout.channel.recv(4096).decode('utf-8', errors='ignore'))
+        
+    exit_status = stdout.channel.recv_exit_status()
+    return exit_status, "".join(output_lines)
+
 def auto_install_and_setup(ip: str, password: str) -> tuple[bool, str, dict]:
     try:
+        # Sanitize IP address (strip http://, https://, or trailing ports/paths if pasted)
+        clean_ip = ip.strip().replace("http://", "").replace("https://", "").split("/")[0].split(":")[0]
+        
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(ip, username='root', password=password, timeout=30)
         
-        # Generate Random Admin details
+        logger.info(f"Connecting via SSH to {clean_ip}...")
+        ssh.connect(clean_ip, port=22, username='root', password=password, timeout=30, banner_timeout=30)
+        
         panel_user = f"admin{random.randint(100, 999)}"
         panel_pass = f"pass{random.randint(1000, 9999)}"
         panel_port = random.randint(10000, 50000)
         
-        # 1. Update OS, install curl, then Install 3x-ui (mhsanaei) silently
-        install_cmd = f'apt-get update -y && apt-get install curl -y && echo -e "y\\n{panel_user}\\n{panel_pass}\\n{panel_port}\\n" | bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)'
+        # 1. Non-interactive installation using official 3x-ui environment variables
+        install_cmd = (
+            'export DEBIAN_FRONTEND=noninteractive && '
+            'apt-get update -y && '
+            'apt-get install -y curl sqlite3 && '
+            'export XUI_NONINTERACTIVE=1 && '
+            f'export XUI_USERNAME="{panel_user}" && '
+            f'export XUI_PASSWORD="{panel_pass}" && '
+            f'export XUI_PANEL_PORT="{panel_port}" && '
+            'export XUI_WEB_BASE_PATH="" && '
+            'bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)'
+        )
         
-        stdin, stdout, stderr = ssh.exec_command(install_cmd)
-        exit_status = stdout.channel.recv_exit_status() # Wait until fully finished
+        logger.info(f"Running non-interactive 3x-ui installation on {clean_ip}...")
+        exit_status, install_output = exec_ssh_command(ssh, install_cmd, timeout=300)
         
-        # 2. Get x25519 reality keys
-        stdin, stdout, stderr = ssh.exec_command("x-ui x25519")
-        key_output = stdout.read().decode()
+        if exit_status != 0:
+            logger.error(f"Install failed on {clean_ip}: {install_output[-500:]}")
+            ssh.close()
+            return False, f"3x-ui တပ်ဆင်မှု မအောင်မြင်ပါ (Exit Code: {exit_status})။ VPS OS အားစစ်ဆေးပါ။", {}
         
-        prv_match = re.search(r'Private key: (\S+)', key_output)
+        # 2. Ensure service is enabled/running and extract x25519 reality keys
+        exec_ssh_command(ssh, "systemctl enable --now x-ui")
+        _, key_output = exec_ssh_command(ssh, "x-ui x25519 || /usr/local/x-ui/bin/xray-linux-amd64 x25519 || /usr/local/x-ui/bin/xray-linux-arm64 x25519")
+        
+        prv_match = re.search(r'Private key:\s*(\S+)', key_output, re.IGNORECASE)
         if not prv_match:
             ssh.close()
-            return False, "x25519 Keys generate လုပ်၍မရပါ။", {}
-        
-        prv_key = prv_match.group(1)
+            return False, "x25519 Reality Keys generate လုပ်၍မရပါ။ x-ui core ထည့်သွင်းမှုကို စစ်ဆေးပါ။", {}
+            
+        prv_key = prv_match.group(1).strip()
         ssh.close()
         
-        # 3. Connect via API and Setup Reality Inbound
-        time.sleep(5) # Wait for panel to start completely
-        base_url = f"http://{ip}:{panel_port}"
-        
+        # 3. Connect via API with retry loop (VPS startup can take up to 20-30s)
+        base_url = f"http://{clean_ip}:{panel_port}"
         xui = XUIClient(base_url, panel_user, panel_pass)
-        if not xui.login():
-            return False, "Panel သို့ API ဖြင့် ဝင်ရောက်၍မရပါ။ Server နှေးနေနိုင်ပါသည်။", {}
+        
+        logger.info(f"Connecting to 3x-ui API at {base_url}...")
+        api_connected = False
+        for attempt in range(6):
+            time.sleep(5)
+            if xui.login():
+                api_connected = True
+                break
+            logger.info(f"API login attempt {attempt+1} failed, retrying in 5s...")
+            
+        if not api_connected:
+            return False, "Panel တပ်ဆင်ပြီးသော်လည်း API သို့ ဝင်ရောက်၍မရပါ။ VPS Firewall သို့မဟုတ် Port ဖွင့်ထားခြင်း ရှိ/မရှိ စစ်ဆေးပါ။", {}
             
         short_id = os.urandom(4).hex()
         inbound_port = 443
         
         res = xui.add_inbound_reality("Auto_VLESS_Reality", inbound_port, prv_key, short_id)
         if not res.get("success"):
-            return False, f"Inbound တည်ဆောက်၍မရပါ: {res.get('msg')}", {}
+            return False, f"Reality Inbound တည်ဆောက်၍မရပါ: {res.get('msg')}", {}
             
-        # Get the new inbound ID
         inbounds = xui.get_inbound_list()
         inbound_id = inbounds[-1].get("id", 1) if inbounds else 1
 
@@ -310,8 +361,13 @@ def auto_install_and_setup(ip: str, password: str) -> tuple[bool, str, dict]:
             "inbound_id": inbound_id
         }
 
+    except paramiko.AuthenticationException:
+        return False, "SSH Root Password မှားယွင်းနေပါသည်။ ပတ်စ်ဝါဒ် ပြန်လည်စစ်ဆေးပါ။", {}
+    except paramiko.SSHException as e:
+        return False, f"SSH Connection Error: {e}", {}
     except Exception as e:
-        return False, f"SSH Error: {e}", {}
+        logger.error(f"Auto setup unexpected error: {e}", exc_info=True)
+        return False, f"System Error: {e}", {}
 
 # ---------------------------------------------------------------------------
 # ၅။ UI & Handlers
@@ -326,7 +382,6 @@ def get_server_list_keyboard(servers: list[dict]):
     for srv in servers:
         buttons.append([InlineKeyboardButton(f"🖥️ {srv['name']}", callback_data=f"srv_sel:{srv['id']}")])
     
-    # ရွေးချယ်စရာ (၂) ခု ထည့်ထားပါသည်
     buttons.append([InlineKeyboardButton("⚡ Auto-Setup ဖြင့် ထည့်မည်", callback_data="auto_setup_start")])
     buttons.append([InlineKeyboardButton("➕ ကိုယ်တိုင် (Manual) ထည့်မည်", callback_data="srv_add")])
     
@@ -353,7 +408,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message: await update.message.reply_text("⛔ သင့်တွင် အသုံးပြုခွင့် မရှိပါ။")
         return ConversationHandler.END
 
-    servers = get_all_servers()
+    servers = await asyncio.to_thread(get_all_servers)
     msg = (
         f"🛡️ <b>Personal VPN Admin Dashboard</b>\n\n"
         f"👤 မင်္ဂလာပါ <b>{user.first_name}</b>\n"
@@ -378,7 +433,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "admin_main":
         await start_command(update, context); return ConversationHandler.END
     elif data == "menu:servers":
-        servers = get_all_servers()
+        servers = await asyncio.to_thread(get_all_servers)
         await query.message.edit_text("🖥️ <b>စီမံလိုသော ဆာဗာကို ရွေးချယ်ပါ</b> 👇", parse_mode="HTML", reply_markup=get_server_list_keyboard(servers))
         return ConversationHandler.END
     elif data == "menu:dashboard" or data == "menu:refresh":
@@ -400,7 +455,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.to_thread(delete_server_from_db, srv_id)
         if srv_id in active_xui_clients: del active_xui_clients[srv_id]
         await query.answer("✅ ဆာဗာ ဖျက်သိမ်းပြီးပါပြီ။")
-        servers = get_all_servers()
+        servers = await asyncio.to_thread(get_all_servers)
         await query.message.edit_text("🖥️ <b>စီမံလိုသော ဆာဗာကို ရွေးချယ်ပါ</b> 👇", parse_mode="HTML", reply_markup=get_server_list_keyboard(servers))
     elif data == "menu:list_keys": await show_client_list(update, context)
     elif data.startswith("client_detail:"): await show_client_detail(update, context, data.split(":")[1])
