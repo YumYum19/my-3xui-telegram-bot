@@ -261,7 +261,7 @@ def get_client(server_data: dict) -> XUIClient:
     return active_xui_clients[s_id]
 
 # ---------------------------------------------------------------------------
-# ၄။ Auto Install SSH Script (With Uninstall & Direct Binary Execution)
+# ၄။ Auto Install SSH Script (v2.5.8 Piped Input & Direct Binary Fix)
 # ---------------------------------------------------------------------------
 def exec_ssh_command(ssh: paramiko.SSHClient, command: str, timeout: int = 300) -> tuple[int, str]:
     """Execute SSH commands with continuous buffer reading to prevent hangs/deadlocks."""
@@ -304,18 +304,13 @@ def auto_install_and_setup(ip: str, password: str) -> tuple[bool, str, dict]:
         panel_pass = f"pass{random.randint(1000, 9999)}"
         panel_port = random.randint(10000, 50000)
         
-        # 2. အဆင့် (၁) - သင်ပေးပို့သော v2.5.8 Pinned Version ဖြင့် တပ်ဆင်ခြင်း
+        # 2. အဆင့် (၁) - v2.5.8 ၏ Interactive Prompts များကို echo -e piped ဖြင့် အလိုအလျောက် ဖြေကြားတပ်ဆင်ခြင်း
         install_cmd = (
             'export DEBIAN_FRONTEND=noninteractive && '
             'apt-get update -y && '
-            'apt-get install -y curl sqlite3 ca-certificates tar && '
-            'export XUI_NONINTERACTIVE=1 && '
-            f'export XUI_USERNAME="{panel_user}" && '
-            f'export XUI_PASSWORD="{panel_pass}" && '
-            f'export XUI_PANEL_PORT="{panel_port}" && '
-            'export XUI_WEB_BASE_PATH="" && '
+            'apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" curl sqlite3 ca-certificates tar && '
             'export VERSION="v2.5.8" && '
-            'bash <(curl -Ls "https://raw.githubusercontent.com/mhsanaei/3x-ui/$VERSION/install.sh") $VERSION'
+            f'echo -e "y\\n{panel_user}\\n{panel_pass}\\n{panel_port}\\n" | bash <(curl -Ls "https://raw.githubusercontent.com/mhsanaei/3x-ui/$VERSION/install.sh") $VERSION'
         )
         
         logger.info(f"Running v2.5.8 3x-ui installation on {clean_ip}...")
@@ -329,7 +324,6 @@ def auto_install_and_setup(ip: str, password: str) -> tuple[bool, str, dict]:
         # 3. အဆင့် (၂) - Menu wrapper ကိုကျော်ပြီး Xray Binary ဖြင့် x25519 key တိုက်ရိုက်ထုတ်ယူခြင်း
         exec_ssh_command(ssh, "systemctl daemon-reload 2>/dev/null; systemctl enable --now x-ui 2>/dev/null; sleep 3;")
         
-        # CPU Architecture အလိုက် Xray root binary ကို တိုက်ရိုက် လှမ်းခေါ်သော စနစ်
         x25519_cmd = (
             'ARCH=$(uname -m); '
             'if [ "$ARCH" = "x86_64" ]; then BIN="/usr/local/x-ui/bin/xray-linux-amd64"; '
