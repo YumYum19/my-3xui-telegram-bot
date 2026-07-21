@@ -261,7 +261,7 @@ def get_client(server_data: dict) -> XUIClient:
     return active_xui_clients[s_id]
 
 # ---------------------------------------------------------------------------
-# ၄။ Auto Install SSH Script (Upgraded & Deadlock-Free)
+# ၄။ Auto Install SSH Script (Upgraded & Robust Key Generation)
 # ---------------------------------------------------------------------------
 def exec_ssh_command(ssh: paramiko.SSHClient, command: str, timeout: int = 300) -> tuple[int, str]:
     """Execute SSH commands with continuous buffer reading to prevent hangs/deadlocks."""
@@ -282,7 +282,6 @@ def exec_ssh_command(ssh: paramiko.SSHClient, command: str, timeout: int = 300) 
 
 def auto_install_and_setup(ip: str, password: str) -> tuple[bool, str, dict]:
     try:
-        # Sanitize IP address (strip http://, https://, or trailing ports/paths if pasted)
         clean_ip = ip.strip().replace("http://", "").replace("https://", "").split("/")[0].split(":")[0]
         
         ssh = paramiko.SSHClient()
@@ -299,7 +298,7 @@ def auto_install_and_setup(ip: str, password: str) -> tuple[bool, str, dict]:
         install_cmd = (
             'export DEBIAN_FRONTEND=noninteractive && '
             'apt-get update -y && '
-            'apt-get install -y curl sqlite3 && '
+            'apt-get install -y curl sqlite3 ca-certificates tar && '
             'export XUI_NONINTERACTIVE=1 && '
             f'export XUI_USERNAME="{panel_user}" && '
             f'export XUI_PASSWORD="{panel_pass}" && '
@@ -316,25 +315,42 @@ def auto_install_and_setup(ip: str, password: str) -> tuple[bool, str, dict]:
             ssh.close()
             return False, f"3x-ui တပ်ဆင်မှု မအောင်မြင်ပါ (Exit Code: {exit_status})။ VPS OS အားစစ်ဆေးပါ။", {}
         
-        # 2. Ensure service is enabled/running and extract x25519 reality keys
-        exec_ssh_command(ssh, "systemctl enable --now x-ui")
-        _, key_output = exec_ssh_command(ssh, "x-ui x25519 || /usr/local/x-ui/bin/xray-linux-amd64 x25519 || /usr/local/x-ui/bin/xray-linux-arm64 x25519")
+        # 2. Ensure service is running and extract x25519 reality keys robustly
+        exec_ssh_command(ssh, "systemctl daemon-reload 2>/dev/null; systemctl enable --now x-ui 2>/dev/null; sleep 3;")
         
-        prv_match = re.search(r'Private key:\s*(\S+)', key_output, re.IGNORECASE)
+        # Comprehensive binary search across all possible paths
+        x25519_cmd = (
+            'export PATH=$PATH:/usr/local/bin:/usr/bin:/usr/local/x-ui:/usr/local/x-ui/bin; '
+            'if command -v x-ui >/dev/null 2>&1; then x-ui x25519; '
+            'elif [ -f /usr/local/x-ui/x-ui.sh ]; then bash /usr/local/x-ui/x-ui.sh x25519; '
+            'else '
+            'XRAY_BIN=$(find /usr/ -name "xray*" -type f 2>/dev/null | head -n 1); '
+            'if [ -n "$XRAY_BIN" ]; then chmod +x "$XRAY_BIN" && "$XRAY_BIN" x25519; '
+            'else echo "ERROR_XRAY_BINARY_NOT_FOUND"; fi; '
+            'fi'
+        )
+        _, key_output = exec_ssh_command(ssh, x25519_cmd)
+        
+        # Remove ANSI color escape sequences from terminal output before regex matching
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0?]*[ -/]*[@-~])')
+        clean_output = ansi_escape.sub('', key_output)
+        
+        prv_match = re.search(r'Private\s*key\s*:\s*([a-zA-Z0-9_\-=]+)', clean_output, re.IGNORECASE)
         if not prv_match:
             ssh.close()
-            return False, "x25519 Reality Keys generate လုပ်၍မရပါ။ x-ui core ထည့်သွင်းမှုကို စစ်ဆေးပါ။", {}
+            err_detail = clean_output.strip() if clean_output.strip() else "No output returned from xray binary."
+            return False, f"x25519 Reality Keys generate လုပ်၍မရပါ။\n[Output Details]: <code>{err_detail[:250]}</code>", {}
             
         prv_key = prv_match.group(1).strip()
         ssh.close()
         
-        # 3. Connect via API with retry loop (VPS startup can take up to 20-30s)
+        # 3. Connect via API with retry loop (VPS startup can take up to 30-40s)
         base_url = f"http://{clean_ip}:{panel_port}"
         xui = XUIClient(base_url, panel_user, panel_pass)
         
         logger.info(f"Connecting to 3x-ui API at {base_url}...")
         api_connected = False
-        for attempt in range(6):
+        for attempt in range(8):
             time.sleep(5)
             if xui.login():
                 api_connected = True
