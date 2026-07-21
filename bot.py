@@ -266,10 +266,11 @@ def auto_install_and_setup(ip: str, password: str) -> tuple[bool, str, dict]:
         panel_pass = f"pass{random.randint(1000, 9999)}"
         panel_port = random.randint(10000, 50000)
         
-        # 1. Install 3x-ui (mhsanaei) silently
-        install_cmd = f'echo -e "y\\n{panel_user}\\n{panel_pass}\\n{panel_port}\\n" | bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)'
+        # 1. Update OS, install curl, then Install 3x-ui (mhsanaei) silently
+        install_cmd = f'apt-get update -y && apt-get install curl -y && echo -e "y\\n{panel_user}\\n{panel_pass}\\n{panel_port}\\n" | bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)'
+        
         stdin, stdout, stderr = ssh.exec_command(install_cmd)
-        stdout.channel.recv_exit_status() # Wait until finished
+        exit_status = stdout.channel.recv_exit_status() # Wait until fully finished
         
         # 2. Get x25519 reality keys
         stdin, stdout, stderr = ssh.exec_command("x-ui x25519")
@@ -284,12 +285,12 @@ def auto_install_and_setup(ip: str, password: str) -> tuple[bool, str, dict]:
         ssh.close()
         
         # 3. Connect via API and Setup Reality Inbound
-        time.sleep(3) # Wait for panel to start completely
+        time.sleep(5) # Wait for panel to start completely
         base_url = f"http://{ip}:{panel_port}"
         
         xui = XUIClient(base_url, panel_user, panel_pass)
         if not xui.login():
-            return False, "Panel သို့ API ဖြင့် ဝင်ရောက်၍မရပါ။", {}
+            return False, "Panel သို့ API ဖြင့် ဝင်ရောက်၍မရပါ။ Server နှေးနေနိုင်ပါသည်။", {}
             
         short_id = os.urandom(4).hex()
         inbound_port = 443
