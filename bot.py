@@ -261,7 +261,7 @@ def get_client(server_data: dict) -> XUIClient:
     return active_xui_clients[s_id]
 
 # ---------------------------------------------------------------------------
-# ၄။ Auto Install SSH Script (v2.5.8 Piped Input & Direct Binary Fix)
+# ၄။ Auto Install SSH Script (With Auto-Firewall & Local Health Check)
 # ---------------------------------------------------------------------------
 def exec_ssh_command(ssh: paramiko.SSHClient, command: str, timeout: int = 300) -> tuple[int, str]:
     """Execute SSH commands with continuous buffer reading to prevent hangs/deadlocks."""
@@ -308,7 +308,7 @@ def auto_install_and_setup(ip: str, password: str) -> tuple[bool, str, dict]:
         install_cmd = (
             'export DEBIAN_FRONTEND=noninteractive && '
             'apt-get update -y && '
-            'apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" curl sqlite3 ca-certificates tar && '
+            'apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" curl sqlite3 ca-certificates tar ufw iptables && '
             'export VERSION="v2.5.8" && '
             f'echo -e "y\\n{panel_user}\\n{panel_pass}\\n{panel_port}\\n" | bash <(curl -Ls "https://raw.githubusercontent.com/mhsanaei/3x-ui/$VERSION/install.sh") $VERSION'
         )
@@ -321,9 +321,20 @@ def auto_install_and_setup(ip: str, password: str) -> tuple[bool, str, dict]:
             ssh.close()
             return False, f"3x-ui တပ်ဆင်မှု မအောင်မြင်ပါ (Exit Code: {exit_status})။ VPS OS အားစစ်ဆေးပါ။", {}
         
-        # 3. အဆင့် (၂) - Menu wrapper ကိုကျော်ပြီး Xray Binary ဖြင့် x25519 key တိုက်ရိုက်ထုတ်ယူခြင်း
-        exec_ssh_command(ssh, "systemctl daemon-reload 2>/dev/null; systemctl enable --now x-ui 2>/dev/null; sleep 3;")
-        
+        # 3. အဆင့် (၂) - Firewall (ufw & iptables) တွင် Panel Port နှင့် VLESS Port 443 ကို Auto ဖွင့်ပေးခြင်း
+        logger.info(f"Configuring local firewall for port {panel_port} and 443...")
+        firewall_cmd = (
+            f"ufw allow {panel_port}/tcp 2>/dev/null; "
+            f"ufw allow 443/tcp 2>/dev/null; "
+            f"iptables -I INPUT -p tcp --dport {panel_port} -j ACCEPT 2>/dev/null; "
+            f"iptables -I INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null; "
+            f"ip6tables -I INPUT -p tcp --dport {panel_port} -j ACCEPT 2>/dev/null; "
+            f"ip6tables -I INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null; "
+            f"systemctl daemon-reload 2>/dev/null; systemctl enable --now x-ui 2>/dev/null; sleep 3;"
+        )
+        exec_ssh_command(ssh, firewall_cmd)
+
+        # 4. အဆင့် (၃) - Xray Binary ဖြင့် x25519 key တိုက်ရိုက်ထုတ်ယူခြင်း
         x25519_cmd = (
             'ARCH=$(uname -m); '
             'if [ "$ARCH" = "x86_64" ]; then BIN="/usr/local/x-ui/bin/xray-linux-amd64"; '
@@ -347,9 +358,13 @@ def auto_install_and_setup(ip: str, password: str) -> tuple[bool, str, dict]:
             return False, f"x25519 Reality Keys generate လုပ်၍မရပါ။\n[Output Details]: <code>{err_detail[:250]}</code>", {}
             
         prv_key = prv_match.group(1).strip()
+        
+        # Localhost Health Check (VPS အတွင်းမှာ Panel တကယ် အလုပ်လုပ်/မလုပ် အရင်စစ်ဆေးခြင်း)
+        _, local_check = exec_ssh_command(ssh, f"curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{panel_port}/login")
+        is_locally_running = (local_check.strip() in ["200", "405", "302", "301"])
         ssh.close()
         
-        # 4. အဆင့် (၃) - API သို့ ချိတ်ဆက်ခြင်း
+        # 5. အဆင့် (၄) - API သို့ ချိတ်ဆက်ခြင်း
         base_url = f"http://{clean_ip}:{panel_port}"
         xui = XUIClient(base_url, panel_user, panel_pass)
         
@@ -363,7 +378,14 @@ def auto_install_and_setup(ip: str, password: str) -> tuple[bool, str, dict]:
             logger.info(f"API login attempt {attempt+1} failed, retrying in 5s...")
             
         if not api_connected:
-            return False, "Panel တပ်ဆင်ပြီးသော်လည်း API သို့ ဝင်ရောက်၍မရပါ။ VPS Firewall သို့မဟုတ် Port ဖွင့်ထားခြင်း ရှိ/မရှိ စစ်ဆေးပါ။", {}
+            if is_locally_running:
+                return False, (
+                    f"⚠️ <b>Panel တပ်ဆင်မှု အောင်မြင်သော်လည်း အပြင်မှ API ဝင်ရောက်၍မရပါ။</b>\n\n"
+                    f"ဆာဗာအတွင်း၌ Panel သည် Port <code>{panel_port}</code> တွင် ပုံမှန်အလုပ်လုပ်နေပါသည်။ သို့သော် သင်၏ Cloud Provider (AWS, Oracle, DigitalOcean, Alibaba စသည်) ၏ **Security Group / Virtual Cloud Network Firewall** တွင် Inbound Port မဖွင့်ရသေးသောကြောင့် ဖြစ်ပါသည်။\n\n"
+                    f"👉 ကျေးဇူးပြု၍ Cloud Dashboard သို့ ဝင်ရောက်ပြီး <b>TCP Port <code>{panel_port}</code></b> နှင့် <b><code>443</code></b> ကို Inbound Open လုပ်ပေးပြီးမှ ထပ်မံကြိုးစားပါ။"
+                ), {}
+            else:
+                return False, "Panel တပ်ဆင်မှု ပြီးစီးသော်လည်း x-ui service စတင်အလုပ်မလုပ်ပါ။ VPS RAM သို့မဟုတ် Disk Space မလောက်ခြင်း ဖြစ်နိုင်ပါသည်။", {}
             
         short_id = os.urandom(4).hex()
         inbound_port = 443
@@ -515,7 +537,7 @@ async def auto_setup_process(update: Update, context: ContextTypes.DEFAULT_TYPE)
     success, msg, data = await asyncio.to_thread(auto_install_and_setup, ip, password)
     
     if not success:
-        await msg_handle.edit_text(f"❌ <b>တပ်ဆင်မှု မအောင်မြင်ပါ။</b>\n\nအကြောင်းရင်း: {msg}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ပြန်လည်ကြိုးစားမည်", callback_data="menu:servers")]]))
+        await msg_handle.edit_text(f"❌ <b>တပ်ဆင်မှု မအောင်မြင်ပါ။</b>\n\n{msg}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ပြန်လည်ကြိုးစားမည်", callback_data="menu:servers")]]))
         return ConversationHandler.END
 
     context.user_data["setup_data"] = data
